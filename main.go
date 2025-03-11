@@ -147,11 +147,64 @@ func (p *KaleMetricsProcessor) processEventMessage(ctx context.Context, contract
 		return fmt.Errorf("error unmarshaling event data: %w", err)
 	}
 
-	// Extract block index
+	// Try to extract block index from the event data
 	blockIndex, err := p.extractBlockIndex(eventData, eventType)
 	if err != nil {
-		log.Printf("Error extracting block index: %v", err)
-		return nil
+		log.Printf("Warning: Could not extract block index from event data: %v", err)
+
+		// Try to extract from diagnostic events
+		if diagnosticEventsRaw, ok := contractEvent["diagnostic_events"].([]interface{}); ok {
+			for _, eventRaw := range diagnosticEventsRaw {
+				if event, ok := eventRaw.(map[string]interface{}); ok {
+					if opType, ok := event["type"].(string); ok && opType == "storage_op" {
+						if dataRaw, ok := event["data"].(map[string]interface{}); ok {
+							if keyRaw, ok := dataRaw["key"].(map[string]interface{}); ok {
+								if keyType, ok := keyRaw["type"].(string); ok && keyType == "Block" {
+									if keyVec, ok := keyRaw["vec"].([]interface{}); ok && len(keyVec) > 0 {
+										if u32Map, ok := keyVec[0].(map[string]interface{}); ok {
+											if u32Val, ok := u32Map["U32"].(float64); ok {
+												blockIndex = uint32(u32Val)
+												log.Printf("Extracted block index %d from Block key in diagnostic events", blockIndex)
+												break
+											}
+										}
+									}
+								} else if keyType, ok := keyRaw["type"].(string); ok && keyType == "Pail" {
+									if keyVec, ok := keyRaw["vec"].([]interface{}); ok && len(keyVec) > 1 {
+										if u32Map, ok := keyVec[1].(map[string]interface{}); ok {
+											if u32Val, ok := u32Map["U32"].(float64); ok {
+												blockIndex = uint32(u32Val)
+												log.Printf("Extracted block index %d from Pail key in diagnostic events", blockIndex)
+												break
+											}
+										}
+									}
+								} else if keyType, ok := keyRaw["type"].(string); ok && keyType == "FarmIndex" {
+									if valRaw, ok := dataRaw["val"].(map[string]interface{}); ok {
+										if u32Val, ok := valRaw["U32"].(float64); ok {
+											blockIndex = uint32(u32Val)
+											log.Printf("Extracted block index %d from FarmIndex in diagnostic events", blockIndex)
+											break
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// If we still couldn't extract the block index, try to get it from the ledger sequence
+		if blockIndex == 0 {
+			if ledgerSeq, ok := contractEvent["ledger_sequence"].(float64); ok {
+				blockIndex = uint32(ledgerSeq)
+				log.Printf("Using ledger sequence %d as fallback for block index", blockIndex)
+			} else {
+				log.Printf("ERROR: Could not determine block index, skipping event")
+				return nil
+			}
+		}
 	}
 
 	log.Printf("Extracted block index: %d for event type: %s", blockIndex, eventType)
@@ -198,9 +251,25 @@ func (p *KaleMetricsProcessor) processEventMessage(ctx context.Context, contract
 			if metrics.MinZeros == 0 || uint32(zeros) < metrics.MinZeros {
 				metrics.MinZeros = uint32(zeros)
 			}
+
+			// Update highest zero count
+			if zeros > metrics.HighestZeroCount {
+				log.Printf("Updating highest zero count from %d to %d for block %d",
+					metrics.HighestZeroCount, zeros, metrics.BlockIndex)
+				metrics.HighestZeroCount = zeros
+			}
 		}
 
 		p.updateWorkMetrics(metrics, eventData, farmerAddr)
+
+		// After updating work metrics, ensure highest zero count is updated from all farmer zero counts
+		for _, zeroCount := range metrics.FarmerZeroCounts {
+			if zeroCount > metrics.HighestZeroCount {
+				log.Printf("Updating highest zero count from %d to %d for block %d based on farmer zero counts",
+					metrics.HighestZeroCount, zeroCount, metrics.BlockIndex)
+				metrics.HighestZeroCount = zeroCount
+			}
+		}
 	}
 
 	// Forward metrics to consumers
@@ -258,7 +327,7 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, raw
 		}
 	}
 
-	// Extract block index from ledger sequence
+	// Extract block index from ledger sequence as a fallback
 	ledgerSeq, ok := rawMessage["ledger_sequence"].(float64)
 	if !ok {
 		log.Printf("DEBUG: No ledger sequence in invocation message, skipping")
@@ -266,6 +335,114 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, raw
 	}
 
 	log.Printf("Invocation in ledger sequence: %.0f", ledgerSeq)
+
+	// Default block index to ledger sequence
+	blockIndex := uint32(ledgerSeq)
+
+	// For harvest invocations, extract the block index from the arguments
+	if functionName == "harvest" {
+		log.Printf("HARVEST INVOCATION DETECTED - Extracting block index from arguments")
+
+		// Extract arguments
+		argsRaw, ok := rawMessage["arguments"].([]interface{})
+		if ok && len(argsRaw) >= 2 {
+			log.Printf("Harvest arguments: %+v", argsRaw)
+
+			// The second argument should be the block index
+			if indexArg, ok := argsRaw[1].(map[string]interface{}); ok {
+				log.Printf("Index argument: %+v", indexArg)
+
+				// Try to extract the index value
+				if u32Val, ok := indexArg["U32"].(float64); ok {
+					blockIndex = uint32(u32Val)
+					log.Printf("Extracted block index %d from harvest arguments", blockIndex)
+				}
+			}
+		}
+	}
+
+	// For plant invocations, we need to check if this is a new block
+	if functionName == "plant" {
+		// Check if we have a FarmIndex in the diagnostic events
+		diagnosticEventsRaw, ok := rawMessage["diagnostic_events"]
+		if ok {
+			diagnosticEvents, ok := diagnosticEventsRaw.([]interface{})
+			if ok && len(diagnosticEvents) > 0 {
+				for _, eventRaw := range diagnosticEvents {
+					event, ok := eventRaw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					// Look for storage operations that might contain the FarmIndex
+					if opType, ok := event["type"].(string); ok && opType == "storage_op" {
+						if dataRaw, ok := event["data"].(map[string]interface{}); ok {
+							if keyRaw, ok := dataRaw["key"].(map[string]interface{}); ok {
+								if keyType, ok := keyRaw["type"].(string); ok && keyType == "FarmIndex" {
+									if valRaw, ok := dataRaw["val"].(map[string]interface{}); ok {
+										if u32Val, ok := valRaw["U32"].(float64); ok {
+											blockIndex = uint32(u32Val)
+											log.Printf("Extracted block index %d from FarmIndex in diagnostic events", blockIndex)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// For work invocations, try to extract the block index from the arguments
+	if functionName == "work" {
+		// Extract arguments
+		argsRaw, ok := rawMessage["arguments"].([]interface{})
+		if ok && len(argsRaw) >= 1 {
+			// Try to extract the block index from diagnostic events
+			diagnosticEventsRaw, ok := rawMessage["diagnostic_events"]
+			if ok {
+				diagnosticEvents, ok := diagnosticEventsRaw.([]interface{})
+				if ok && len(diagnosticEvents) > 0 {
+					for _, eventRaw := range diagnosticEvents {
+						event, ok := eventRaw.(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						// Look for storage operations that might contain the block index
+						if opType, ok := event["type"].(string); ok && opType == "storage_op" {
+							if dataRaw, ok := event["data"].(map[string]interface{}); ok {
+								if keyRaw, ok := dataRaw["key"].(map[string]interface{}); ok {
+									if keyType, ok := keyRaw["type"].(string); ok && keyType == "Block" {
+										if keyVec, ok := keyRaw["vec"].([]interface{}); ok && len(keyVec) > 0 {
+											if u32Map, ok := keyVec[0].(map[string]interface{}); ok {
+												if u32Val, ok := u32Map["U32"].(float64); ok {
+													blockIndex = uint32(u32Val)
+													log.Printf("Extracted block index %d from Block key in diagnostic events", blockIndex)
+												}
+											}
+										}
+									} else if keyType, ok := keyRaw["type"].(string); ok && keyType == "Pail" {
+										if keyVec, ok := keyRaw["vec"].([]interface{}); ok && len(keyVec) > 1 {
+											if u32Map, ok := keyVec[1].(map[string]interface{}); ok {
+												if u32Val, ok := u32Map["U32"].(float64); ok {
+													blockIndex = uint32(u32Val)
+													log.Printf("Extracted block index %d from Pail key in diagnostic events", blockIndex)
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("Using block index: %d for function: %s", blockIndex, functionName)
 
 	// Check for diagnostic events
 	diagnosticEventsRaw, ok := rawMessage["diagnostic_events"]
@@ -282,150 +459,10 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, raw
 
 	log.Printf("Found %d diagnostic events in invocation", len(diagnosticEvents))
 
-	// Extract block index based on function name
-	blockIndex := uint32(ledgerSeq) // Default to ledger sequence
-	log.Printf("Default block index from ledger sequence: %d", blockIndex)
-
-	// Extract zero count from work submissions
-	if functionName == "work" {
-		// Get the farmer address from the invoking account
-		farmerAddr := ""
-		if invokingAccount, ok := rawMessage["invoking_account"].(string); ok && invokingAccount != "" {
-			farmerAddr = invokingAccount
-		}
-
-		// Extract hash from arguments
-		argsRaw, ok := rawMessage["arguments"].([]interface{})
-		if ok && len(argsRaw) >= 2 {
-			// The second argument should contain the hash
-			if hashArg, ok := argsRaw[1].(map[string]interface{}); ok {
-				if hashVal, ok := hashArg["hash"].(string); ok {
-					// Count leading zeros in the hash
-					zeroCount := countLeadingZeros(hashVal)
-					log.Printf("Extracted zero count %d from hash %s for farmer %s", zeroCount, hashVal, farmerAddr)
-
-					// Update metrics
-					metrics := p.getOrCreateBlockMetrics(blockIndex)
-					if farmerAddr != "" {
-						metrics.FarmerZeroCounts[farmerAddr] = int(zeroCount)
-						log.Printf("Updated zero count for farmer %s to %d", farmerAddr, zeroCount)
-					}
-
-					// Update max/min zeros
-					metrics.MaxZeros = max(metrics.MaxZeros, zeroCount)
-					if metrics.MinZeros == 0 || zeroCount < metrics.MinZeros {
-						metrics.MinZeros = zeroCount
-					}
-
-					// Forward updated metrics
-					return p.forwardToConsumers(ctx, metrics)
-				}
-			}
-		}
-	}
-
-	// Extract zero count from diagnostic events
-	if functionName == "work" {
-		blockIndex := uint32(ledgerSeq) // Default to ledger sequence
-		metrics := p.getOrCreateBlockMetrics(blockIndex)
-
-		// Get the farmer address
-		farmerAddr := ""
-		if invokingAccount, ok := rawMessage["invoking_account"].(string); ok && invokingAccount != "" {
-			farmerAddr = invokingAccount
-		}
-
-		// Look for diagnostic events that might contain the hash or zero count
-		diagnosticEventsRaw, ok := rawMessage["diagnostic_events"]
-		if ok {
-			diagnosticEvents, ok := diagnosticEventsRaw.([]interface{})
-			if ok && len(diagnosticEvents) > 0 {
-				log.Printf("Found %d diagnostic events in work invocation", len(diagnosticEvents))
-
-				// Look for events with hash information
-				for i, eventRaw := range diagnosticEvents {
-					event, ok := eventRaw.(map[string]interface{})
-					if !ok {
-						continue
-					}
-
-					log.Printf("Diagnostic event %d: %+v", i, event)
-
-					// Look for data field that might contain the hash
-					if dataRaw, ok := event["data"].(map[string]interface{}); ok {
-						log.Printf("Event data: %+v", dataRaw)
-
-						// Try to extract hash from various fields
-						if hashVal, ok := dataRaw["hash"].(string); ok {
-							log.Printf("Found hash in diagnostic event: %s", hashVal)
-							zeroCount := countLeadingZeros(hashVal)
-							log.Printf("Extracted zero count %d from hash in diagnostic event", zeroCount)
-
-							// Update metrics
-							if farmerAddr != "" {
-								metrics.FarmerZeroCounts[farmerAddr] = int(zeroCount)
-								log.Printf("Updated zero count for farmer %s to %d from diagnostic event", farmerAddr, zeroCount)
-							}
-
-							// Update max/min zeros
-							metrics.MaxZeros = max(metrics.MaxZeros, zeroCount)
-							if metrics.MinZeros == 0 || zeroCount < metrics.MinZeros {
-								metrics.MinZeros = zeroCount
-							}
-
-							// Forward updated metrics
-							return p.forwardToConsumers(ctx, metrics)
-						}
-
-						// Try to extract zeros directly
-						if zerosVal, ok := dataRaw["zeros"].(float64); ok {
-							zeroCount := uint32(zerosVal)
-							log.Printf("Found zeros value in diagnostic event: %d", zeroCount)
-
-							// Update metrics
-							if farmerAddr != "" {
-								metrics.FarmerZeroCounts[farmerAddr] = int(zeroCount)
-								log.Printf("Updated zero count for farmer %s to %d from diagnostic event zeros", farmerAddr, zeroCount)
-							}
-
-							// Update max/min zeros
-							metrics.MaxZeros = max(metrics.MaxZeros, zeroCount)
-							if metrics.MinZeros == 0 || zeroCount < metrics.MinZeros {
-								metrics.MinZeros = zeroCount
-							}
-
-							// Forward updated metrics
-							return p.forwardToConsumers(ctx, metrics)
-						}
-					}
-				}
-			}
-		}
-	}
-
 	// Get or create block metrics
 	metrics := p.getOrCreateBlockMetrics(blockIndex)
 
-	// Check for diagnostic events
-	diagnosticEventsRaw, ok = rawMessage["diagnostic_events"]
-	if !ok {
-		log.Printf("DEBUG: No diagnostic events in invocation message, skipping")
-		return nil // No diagnostic events
-	}
-
-	diagnosticEvents, ok = diagnosticEventsRaw.([]interface{})
-	if !ok || len(diagnosticEvents) == 0 {
-		log.Printf("DEBUG: Invalid or empty diagnostic events, skipping")
-		return nil // No valid diagnostic events
-	}
-
-	log.Printf("Found %d diagnostic events in invocation", len(diagnosticEvents))
-
-	// Process each diagnostic event to find mint/burn events
-	var totalReward int64
-	var totalStaked int64
-
-	// Check if this is a harvest invocation by looking for specific patterns in the diagnostic events
+	// Check if this is a harvest invocation
 	isHarvest := false
 	var closeTimeMs int64
 
@@ -496,6 +533,10 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, raw
 			}
 		}
 	}
+
+	// Process each diagnostic event to find mint/burn events
+	var totalReward int64
+	var totalStaked int64
 
 	// Process each diagnostic event to find mint/burn events
 	for _, eventRaw := range diagnosticEvents {
@@ -640,8 +681,16 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, raw
 				// Set a default zero count if we don't have one yet
 				if _, exists := metrics.FarmerZeroCounts[farmerAddr]; !exists {
 					// Use a default value of 8 (common minimum for Kale mining)
-					metrics.FarmerZeroCounts[farmerAddr] = 8
-					log.Printf("Set default zero count of 8 for farmer %s", farmerAddr)
+					defaultZeroCount := 8
+					metrics.FarmerZeroCounts[farmerAddr] = defaultZeroCount
+					log.Printf("Set default zero count of %d for farmer %s", defaultZeroCount, farmerAddr)
+
+					// Update highest zero count if needed
+					if defaultZeroCount > metrics.HighestZeroCount {
+						log.Printf("Updating highest zero count from %d to %d for block %d based on default zero count",
+							metrics.HighestZeroCount, defaultZeroCount, metrics.BlockIndex)
+						metrics.HighestZeroCount = defaultZeroCount
+					}
 				}
 			}
 		}
@@ -660,6 +709,7 @@ func (p *KaleMetricsProcessor) getOrCreateBlockMetrics(blockIndex uint32) *KaleB
 			BlockIndex:       blockIndex,
 			Timestamp:        time.Now(),
 			Participants:     0,
+			HighestZeroCount: 0,
 			Farmers:          []string{},
 			FarmerStakes:     make(map[string]int64),
 			FarmerRewards:    make(map[string]int64),
@@ -681,6 +731,14 @@ func (p *KaleMetricsProcessor) getOrCreateBlockMetrics(blockIndex uint32) *KaleB
 			metrics.FarmerZeroCounts = make(map[string]int)
 		}
 	}
+
+	// Update highest zero count from farmer zero counts
+	for _, zeroCount := range metrics.FarmerZeroCounts {
+		if zeroCount > metrics.HighestZeroCount {
+			metrics.HighestZeroCount = zeroCount
+		}
+	}
+
 	return metrics
 }
 
@@ -714,14 +772,36 @@ func (p *KaleMetricsProcessor) forwardToConsumers(ctx context.Context, metrics *
 		}
 	}
 
+	// Calculate the highest zero count from the farmer zero counts
+	highestZeroCount := 0
+	for _, zeroCount := range metrics.FarmerZeroCounts {
+		if zeroCount > highestZeroCount {
+			highestZeroCount = zeroCount
+		}
+	}
+
+	// Update the highest_zero_count field
+	if highestZeroCount > metrics.HighestZeroCount {
+		log.Printf("Updating highest_zero_count from %d to %d for block %d",
+			metrics.HighestZeroCount, highestZeroCount, metrics.BlockIndex)
+		metrics.HighestZeroCount = highestZeroCount
+	}
+
+	// Also ensure MaxZeros is updated
+	if uint32(highestZeroCount) > metrics.MaxZeros {
+		log.Printf("Updating MaxZeros from %d to %d for block %d",
+			metrics.MaxZeros, highestZeroCount, metrics.BlockIndex)
+		metrics.MaxZeros = uint32(highestZeroCount)
+	}
+
 	data, err := json.Marshal(metrics)
 	if err != nil {
 		return err
 	}
 
 	log.Printf("Preparing to forward metrics for block %d to %d consumers", metrics.BlockIndex, len(p.consumers))
-	log.Printf("Metrics data: BlockIndex=%d, Participants=%d, TotalStaked=%d, TotalReward=%d",
-		metrics.BlockIndex, metrics.Participants, metrics.TotalStaked, metrics.TotalReward)
+	log.Printf("Metrics data: BlockIndex=%d, Participants=%d, TotalStaked=%d, TotalReward=%d, HighestZeroCount=%d",
+		metrics.BlockIndex, metrics.Participants, metrics.TotalStaked, metrics.TotalReward, metrics.HighestZeroCount)
 
 	// Log per-farmer data
 	log.Printf("Per-farmer data for block %d:", metrics.BlockIndex)
@@ -864,6 +944,15 @@ func (p *KaleMetricsProcessor) updateWorkMetrics(metrics *KaleBlockMetrics, data
 		log.Printf("No zeros value or hash found in work data for block %d", metrics.BlockIndex)
 	}
 
+	// Calculate the highest zero count from all farmer zero counts
+	for _, zeroCount := range metrics.FarmerZeroCounts {
+		if zeroCount > metrics.HighestZeroCount {
+			log.Printf("Updating highest zero count from %d to %d for block %d based on farmer zero counts",
+				metrics.HighestZeroCount, zeroCount, metrics.BlockIndex)
+			metrics.HighestZeroCount = zeroCount
+		}
+	}
+
 	log.Printf("Updated work metrics for block %d: highestZeroCount=%d, farmer=%s",
 		metrics.BlockIndex, metrics.HighestZeroCount, farmerAddr)
 }
@@ -926,9 +1015,23 @@ func (p *KaleMetricsProcessor) extractBlockIndex(data map[string]interface{}, ev
 	// Different events might have the index in different fields
 	if eventType == "harvest" {
 		indexKey = "index"
+	} else if eventType == "plant" || eventType == "work" {
+		// For plant and work events, try to find the block index
+		// First check if there's a direct index field
+		if indexVal, ok := data["index"].(float64); ok {
+			return uint32(indexVal), nil
+		}
+
+		// Otherwise, look for block_index
+		indexKey = "block_index"
 	} else {
-		// For plant and work, we need to check the contract state
-		indexKey = "index"
+		// For other events, try common field names
+		for _, key := range []string{"index", "block_index", "blockIndex"} {
+			if _, ok := data[key]; ok {
+				indexKey = key
+				break
+			}
+		}
 	}
 
 	if indexVal, ok := data[indexKey]; ok {
@@ -943,6 +1046,10 @@ func (p *KaleMetricsProcessor) extractBlockIndex(data map[string]interface{}, ev
 			return uint32(index), nil
 		}
 	}
+
+	// If we couldn't find the index, log the data for debugging
+	dataBytes, _ := json.Marshal(data)
+	log.Printf("Could not find block index in data: %s", string(dataBytes))
 
 	return 0, fmt.Errorf("block index not found")
 }
