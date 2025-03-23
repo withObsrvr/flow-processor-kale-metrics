@@ -20,16 +20,27 @@
             pname = "flow-processor-kale-metrics";
             version = "1.0.0";
             src = ./.;
+            
+            # Disable vendor checking
             vendorHash = null;
+            allowVendorCheck = false;
+            
+            # Disable hardening which is required for Go plugins
             hardeningDisable = [ "all" ];
+            
+            # Configure build environment for plugin compilation
             preBuild = ''
               export CGO_ENABLED=1
             '';
+            
+            # Build as a shared library/plugin
             buildPhase = ''
               runHook preBuild
-              go build -mod=vendor -buildmode=plugin -o flow-processor-kale-metrics.so .
+              go build -buildmode=plugin -o flow-processor-kale-metrics.so .
               runHook postBuild
             '';
+
+            # Custom install phase for the plugin
             installPhase = ''
               runHook preInstall
               mkdir -p $out/lib
@@ -44,6 +55,7 @@
               fi
               runHook postInstall
             '';
+            
             nativeBuildInputs = [ pkgs.pkg-config ];
           };
         };
