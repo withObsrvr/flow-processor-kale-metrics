@@ -259,11 +259,10 @@ func (p *KaleMetricsProcessor) forwardToConsumers(ctx context.Context, metrics *
 	p.mu.RUnlock()
 
 	if len(consumers) == 0 {
-		log.Printf("No consumers registered, skipping forwarding")
-		return nil
+		log.Printf("No processor consumers registered, skipping forwarding to processors")
+	} else {
+		log.Printf("Forwarding metrics for block %d to %d processor consumers", metrics.BlockIndex, len(consumers))
 	}
-
-	log.Printf("Forwarding metrics for block %d to %d consumers", metrics.BlockIndex, len(consumers))
 
 	// Convert metrics to JSON
 	metricsJSON, err := json.Marshal(metrics)
@@ -285,18 +284,18 @@ func (p *KaleMetricsProcessor) forwardToConsumers(ctx context.Context, metrics *
 		},
 	}
 
-	// Forward to each consumer
+	// Forward to each processor consumer
 	var forwardErrors []error
 	for _, consumer := range consumers {
 		if err := consumer.Process(ctx, msg); err != nil {
-			log.Printf("Error forwarding metrics to consumer: %v", err)
+			log.Printf("Error forwarding metrics to processor consumer: %v", err)
 			forwardErrors = append(forwardErrors, err)
 		}
 	}
 
 	if len(forwardErrors) > 0 {
 		return NewProcessorError(
-			fmt.Errorf("failed to forward metrics to %d out of %d consumers", len(forwardErrors), len(consumers)),
+			fmt.Errorf("failed to forward metrics to %d out of %d processor consumers", len(forwardErrors), len(consumers)),
 			ErrorTypeNetwork,
 			ErrorSeverityWarning,
 		).WithBlock(metrics.BlockIndex).WithContext("error_count", len(forwardErrors))

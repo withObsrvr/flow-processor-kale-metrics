@@ -24,6 +24,7 @@ type KaleMetricsPlugin struct {
 	}
 	startTime  time.Time
 	contractID string
+	consumers  []pluginapi.Consumer
 }
 
 // NewPlugin creates a new KaleMetricsPlugin
@@ -138,6 +139,12 @@ func (p *KaleMetricsPlugin) Process(ctx context.Context, msg pluginapi.Message) 
 		err = p.processEvent(ctx, data)
 	case "contract_invocation":
 		err = p.processInvocation(ctx, data)
+	case "kale_block_metrics":
+		// Pass metrics directly to plugin consumers
+		err = p.forwardToPluginConsumers(ctx, msg)
+		if err != nil {
+			log.Printf("Error forwarding metrics to plugin consumers: %v", err)
+		}
 	default:
 		log.Printf("Unsupported message type: %s", msgType)
 		return nil // Skip unsupported message types
@@ -159,6 +166,42 @@ func (p *KaleMetricsPlugin) processEvent(ctx context.Context, data map[string]in
 func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[string]interface{}) error {
 	err := p.processor.ProcessInvocationMessage(ctx, data)
 	return err
+}
+
+// forwardToPluginConsumers forwards messages to all registered plugin consumers
+func (p *KaleMetricsPlugin) forwardToPluginConsumers(ctx context.Context, msg pluginapi.Message) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("context canceled before forwarding to plugin consumers: %w", err)
+	}
+
+	p.mu.RLock()
+	consumers := make([]pluginapi.Consumer, len(p.consumers))
+	copy(consumers, p.consumers)
+	p.mu.RUnlock()
+
+	if len(consumers) == 0 {
+		log.Printf("No plugin consumers registered, skipping forwarding")
+		return nil
+	}
+
+	log.Printf("Forwarding metrics to %d plugin consumers", len(consumers))
+
+	// Forward to each plugin consumer
+	var forwardErrors []error
+	for _, consumer := range consumers {
+		if err := consumer.Process(ctx, msg); err != nil {
+			log.Printf("Error forwarding metrics to plugin consumer %s: %v", consumer.Name(), err)
+			forwardErrors = append(forwardErrors, err)
+		} else {
+			log.Printf("Successfully forwarded metrics to plugin consumer %s", consumer.Name())
+		}
+	}
+
+	if len(forwardErrors) > 0 {
+		return fmt.Errorf("failed to forward metrics to %d out of %d plugin consumers", len(forwardErrors), len(consumers))
+	}
+
+	return nil
 }
 
 // recordProcessing updates statistics based on message type and success
@@ -253,4 +296,12 @@ func (p *KaleMetricsPlugin) Close() error {
 // SchemaProvider returns whether the plugin implements the SchemaProvider interface
 func (p *KaleMetricsPlugin) SchemaProvider() bool {
 	return true
+}
+
+// RegisterConsumer registers a consumer to receive metrics
+func (p *KaleMetricsPlugin) RegisterConsumer(consumer pluginapi.Consumer) {
+	log.Printf("Registering consumer: %s", consumer.Name())
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.consumers = append(p.consumers, consumer)
 }
