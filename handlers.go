@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -308,39 +309,162 @@ func extractUint32FromValue(val interface{}) (uint32, bool) {
 }
 
 // extractFarmerAddress extracts the farmer address from event data
-func (p *KaleMetricsProcessor) extractFarmerAddress(data map[string]interface{}, event map[string]interface{}) (string, error) {
-	log.Printf("Extracting farmer address from data: %+v", data)
+func extractFarmerAddress(data map[string]interface{}) string {
+	log.Printf("Attempting to extract farmer address from data")
 
-	// Try common field names for farmer address
-	for _, key := range []string{"farmer", "address", "account", "invoking_account"} {
-		if val, ok := data[key]; ok {
-			log.Printf("Found potential farmer address in field %s: %v", key, val)
+	// Check if there's an arguments field which is common in invocations
+	if args, ok := data["arguments"].([]interface{}); ok && len(args) > 0 {
+		// First argument is usually the farmer address
+		firstArg := args[0]
 
-			switch v := val.(type) {
-			case string:
-				return v, nil
-			case map[string]interface{}:
-				// Try to extract from nested map
-				for _, subVal := range v {
-					if strVal, ok := subVal.(string); ok {
-						return strVal, nil
+		log.Printf("First argument type: %T", firstArg)
+		argStr, _ := json.Marshal(firstArg)
+		log.Printf("First argument value: %s", string(argStr))
+
+		// Look for Address field with AccountId
+		accountIdRegex := regexp.MustCompile(`"Address":[^}]*"AccountId":[^}]*"Ed25519":\s*\[([0-9,\s]+)\]`)
+		matches := accountIdRegex.FindStringSubmatch(string(argStr))
+		if len(matches) > 1 {
+			// Convert the byte array to a Stellar address
+			parts := strings.Split(matches[1], ",")
+			bytes := make([]byte, len(parts))
+			for i, s := range parts {
+				s = strings.TrimSpace(s)
+				if val, err := strconv.Atoi(s); err == nil {
+					bytes[i] = byte(val)
+				}
+			}
+
+			// Create an address from the bytes
+			addr := fmt.Sprintf("G%x", bytes)
+			log.Printf("Extracted farmer address from AccountId.Ed25519 bytes: %s", addr)
+			return addr
+		}
+
+		// Direct Ed25519 pattern (no Address wrapper)
+		ed25519Regex := regexp.MustCompile(`"Ed25519":\s*\[([0-9,\s]+)\]`)
+		matches = ed25519Regex.FindStringSubmatch(string(argStr))
+		if len(matches) > 1 {
+			// Convert the byte array to a Stellar address
+			parts := strings.Split(matches[1], ",")
+			bytes := make([]byte, len(parts))
+			for i, s := range parts {
+				s = strings.TrimSpace(s)
+				if val, err := strconv.Atoi(s); err == nil {
+					bytes[i] = byte(val)
+				}
+			}
+
+			// Create an address from the bytes
+			addr := fmt.Sprintf("G%x", bytes)
+			log.Printf("Extracted farmer address from Ed25519 bytes: %s", addr)
+			return addr
+		}
+
+		// Look for String format which may contain the address directly
+		stringRegex := regexp.MustCompile(`"String":\s*"([G|C][A-Z0-9]+)"`)
+		matches = stringRegex.FindStringSubmatch(string(argStr))
+		if len(matches) > 1 {
+			log.Printf("Extracted farmer address from String: %s", matches[1])
+			return matches[1]
+		}
+	}
+
+	// Look for invoking_account which is common in contract invocations
+	if account, ok := data["invoking_account"].(string); ok && (strings.HasPrefix(account, "G") || strings.HasPrefix(account, "C")) {
+		log.Printf("Extracted farmer address from invoking_account: %s", account)
+		return account
+	}
+
+	// Look through transaction metadata for Ed25519 addresses
+	if txMeta, ok := data["tx_meta"].(map[string]interface{}); ok {
+		log.Printf("Found tx_meta field, checking for account information")
+		txMetaStr, _ := json.Marshal(txMeta)
+
+		// Look for Ed25519 addresses in tx_meta
+		ed25519Regex := regexp.MustCompile(`"Ed25519":\s*\[([0-9,\s]+)\]`)
+		matches := ed25519Regex.FindAllStringSubmatch(string(txMetaStr), -1)
+		if len(matches) > 0 {
+			// Use the first match (usually the source account)
+			parts := strings.Split(matches[0][1], ",")
+			bytes := make([]byte, len(parts))
+			for i, s := range parts {
+				s = strings.TrimSpace(s)
+				if val, err := strconv.Atoi(s); err == nil {
+					bytes[i] = byte(val)
+				}
+			}
+
+			addr := fmt.Sprintf("G%x", bytes)
+			log.Printf("Extracted farmer address from tx_meta Ed25519: %s", addr)
+			return addr
+		}
+	}
+
+	// Check SorobanMeta for events with addresses
+	if sorobanMeta, ok := data["soroban_meta"].(map[string]interface{}); ok {
+		log.Printf("Soroban meta structure: %s", prettyPrint(sorobanMeta))
+
+		// Check events for addresses
+		if events, ok := sorobanMeta["Events"].([]interface{}); ok {
+			for _, event := range events {
+				eventMap, ok := event.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				if body, ok := eventMap["Body"].(map[string]interface{}); ok {
+					if v0, ok := body["V0"].(map[string]interface{}); ok {
+						if topics, ok := v0["Topics"].([]interface{}); ok {
+							// Check each topic for an address
+							for _, topic := range topics {
+								topicMap, ok := topic.(map[string]interface{})
+								if !ok {
+									continue
+								}
+
+								if addr, ok := topicMap["Address"].(map[string]interface{}); ok {
+									// Try to get the AccountId
+									if accountId, ok := addr["AccountId"].(map[string]interface{}); ok {
+										if ed25519, ok := accountId["Ed25519"].([]interface{}); ok {
+											// Convert bytes to address
+											bytes := make([]byte, len(ed25519))
+											for i, b := range ed25519 {
+												if val, ok := b.(float64); ok {
+													bytes[i] = byte(val)
+												}
+											}
+
+											addr := fmt.Sprintf("G%x", bytes)
+											log.Printf("Extracted farmer address from event topics: %s", addr)
+											return addr
+										}
+									}
+								}
+							}
+						}
 					}
 				}
 			}
 		}
 	}
 
-	// Try to get from the event if not in data
-	if invokingAccount, ok := event["invoking_account"].(string); ok {
-		return invokingAccount, nil
-	}
-
 	// If we couldn't find the address, try to use transaction hash as a fallback
-	if txHash, ok := event["transaction_hash"].(string); ok {
-		return fmt.Sprintf("tx:%s", txHash), nil
+	if txHash, ok := data["transaction_hash"].(string); ok {
+		addr := fmt.Sprintf("tx:%s", txHash)
+		log.Printf("Using transaction hash as farmer ID: %s", addr)
+		return addr
 	}
 
-	return "", fmt.Errorf("farmer address not found")
+	// Nothing found
+	log.Printf("Could not extract farmer address")
+	return ""
+}
+
+// prettyPrint formats a complex structure for logging
+func prettyPrint(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // updatePlantMetrics updates metrics based on a plant event
@@ -660,60 +784,301 @@ func (p *KaleMetricsProcessor) updateHarvestMetrics(metrics *KaleBlockMetrics, d
 		metrics.BlockIndex, metrics.TotalReward, metrics.CloseTimeMs)
 }
 
-// ForwardMetrics forwards metrics to consumers with the specified block index
+// ForwardMetrics forwards metrics for a block
 func (p *KaleMetricsProcessor) ForwardMetrics(blockIndex uint32, eventType string, data map[string]interface{}) {
-	log.Printf("Forwarding %s metrics for block index %d", eventType, blockIndex)
+	log.Printf("Forwarding metrics for block %d, event type: %s", blockIndex, eventType)
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	// Get or create metrics for this block
 	metrics := p.getOrCreateBlockMetrics(blockIndex)
 
+	// Extract farmer address
+	farmerAddr := "unknown"
+	addrStr := extractFarmerAddress(data)
+	if addrStr != "" {
+		farmerAddr = addrStr
+		log.Printf("Using farmer address: %s for block %d", farmerAddr, blockIndex)
+	} else {
+		log.Printf("Could not extract farmer address for block %d, defaulting to unknown", blockIndex)
+	}
+
 	// Update metrics based on event type
-	switch strings.ToLower(eventType) {
+	switch eventType {
 	case "plant":
-		// Try to extract farmer address for plant metrics
-		farmerAddr := extractFarmerAddress(data)
-		p.updatePlantMetrics(metrics, data, farmerAddr)
+		// Extract stake amount
+		stakeAmount := int64(0)
+
+		// First try arguments
+		if args, ok := data["arguments"].([]interface{}); ok && len(args) >= 2 {
+			// Second argument is typically the stake amount in plant calls
+			argStr, _ := json.Marshal(args[1])
+
+			// Look for I128 value
+			i128Regex := regexp.MustCompile(`"I128"\s*:\s*\{\s*"Hi"\s*:\s*\d+\s*,\s*"Lo"\s*:\s*(\d+)`)
+			matches := i128Regex.FindStringSubmatch(string(argStr))
+			if len(matches) > 1 {
+				if val, err := strconv.ParseInt(matches[1], 10, 64); err == nil {
+					stakeAmount = val
+					log.Printf("Extracted stake amount %d from argument I128", stakeAmount)
+				}
+			}
+		}
+
+		// If not found in arguments, try temporary_data
+		if stakeAmount == 0 {
+			if tempData, ok := data["temporary_data"].([]interface{}); ok {
+				for _, entry := range tempData {
+					if entryMap, ok := entry.(map[string]interface{}); ok {
+						if valueMap, ok := entryMap["value"].(map[string]interface{}); ok {
+							if mapVal, ok := valueMap["Map"].([]interface{}); ok {
+								for _, kv := range mapVal {
+									if kvMap, ok := kv.(map[string]interface{}); ok {
+										if keyMap, ok := kvMap["Key"].(map[string]interface{}); ok {
+											if sym, ok := keyMap["Sym"].(string); ok && sym == "stake" {
+												if valMap, ok := kvMap["Val"].(map[string]interface{}); ok {
+													if i128, ok := valMap["I128"].(map[string]interface{}); ok {
+														if lo, ok := i128["Lo"].(float64); ok {
+															stakeAmount = int64(lo)
+															log.Printf("Extracted stake amount %d from temporary data", stakeAmount)
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// If still not found, try SorobanMeta
+		if stakeAmount == 0 {
+			if sorobanMeta, ok := data["soroban_meta"].(map[string]interface{}); ok {
+				if returnVal, ok := sorobanMeta["ReturnValue"].(map[string]interface{}); ok {
+					if i128, ok := returnVal["I128"].(map[string]interface{}); ok {
+						if lo, ok := i128["Lo"].(float64); ok {
+							stakeAmount = int64(lo)
+							log.Printf("Extracted stake amount %d from SorobanMeta ReturnValue", stakeAmount)
+						}
+					}
+				}
+			}
+		}
+
+		// Update metrics with farmer and stake
+		p.mu.Lock()
+		if !contains(metrics.Farmers, farmerAddr) {
+			metrics.Farmers = append(metrics.Farmers, farmerAddr)
+			metrics.Participants = len(metrics.Farmers)
+		}
+
+		// Update stake
+		metrics.FarmerStakes[farmerAddr] = stakeAmount
+		metrics.TotalStaked += stakeAmount
+		metrics.TransactionHash = getTransactionHash(data)
+
+		// Set open time if not already set
+		if metrics.OpenTimeMs == 0 {
+			metrics.OpenTimeMs = time.Now().UnixMilli()
+		}
+		p.mu.Unlock()
+
+		log.Printf("Updated plant metrics for block %d: farmer=%s, stake=%d, participants=%d, totalStaked=%d",
+			blockIndex, farmerAddr, stakeAmount, metrics.Participants, metrics.TotalStaked)
 
 	case "work":
-		// Try to extract farmer address for work metrics
-		farmerAddr := extractFarmerAddress(data)
-		p.updateWorkMetrics(metrics, data, farmerAddr)
+		// Extract zero count
+		zeroCount := 0
+
+		// Try to extract from arguments
+		if args, ok := data["arguments"].([]interface{}); ok && len(args) >= 2 {
+			// Extract hash from arguments and count zeros
+			argStr, _ := json.Marshal(args[1])
+
+			// Look for Bytes representation
+			bytesRegex := regexp.MustCompile(`"Bytes"\s*:\s*\[([0-9,\s]+)\]`)
+			matches := bytesRegex.FindStringSubmatch(string(argStr))
+			if len(matches) > 1 {
+				parts := strings.Split(matches[1], ",")
+				bytes := make([]byte, len(parts))
+				for i, s := range parts {
+					s = strings.TrimSpace(s)
+					if val, err := strconv.Atoi(s); err == nil {
+						bytes[i] = byte(val)
+					}
+				}
+				hexStr := fmt.Sprintf("%x", bytes)
+				zeroCount = int(countLeadingZeros(hexStr))
+				log.Printf("Extracted hash %s with %d leading zeros from argument bytes", hexStr, zeroCount)
+			}
+		}
+
+		// If not found in arguments, check temporary_data
+		if zeroCount == 0 {
+			if tempData, ok := data["temporary_data"].([]interface{}); ok {
+				for _, entry := range tempData {
+					if entryMap, ok := entry.(map[string]interface{}); ok {
+						if valueMap, ok := entryMap["value"].(map[string]interface{}); ok {
+							if mapVal, ok := valueMap["Map"].([]interface{}); ok {
+								for _, kv := range mapVal {
+									if kvMap, ok := kv.(map[string]interface{}); ok {
+										if keyMap, ok := kvMap["Key"].(map[string]interface{}); ok {
+											if sym, ok := keyMap["Sym"].(string); ok && sym == "zeros" {
+												if valMap, ok := kvMap["Val"].(map[string]interface{}); ok {
+													if u32, ok := valMap["U32"].(float64); ok {
+														zeroCount = int(u32)
+														log.Printf("Extracted zero count %d from temporary data", zeroCount)
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Update metrics with work data
+		p.mu.Lock()
+		if !contains(metrics.Farmers, farmerAddr) {
+			metrics.Farmers = append(metrics.Farmers, farmerAddr)
+			metrics.Participants = len(metrics.Farmers)
+		}
+
+		// Only update if count is greater than existing
+		if zeroCount > metrics.FarmerZeroCounts[farmerAddr] {
+			metrics.FarmerZeroCounts[farmerAddr] = zeroCount
+			log.Printf("Updated zero count for farmer %s to %d", farmerAddr, zeroCount)
+		}
+
+		// Update highest zero count
+		if zeroCount > metrics.HighestZeroCount {
+			metrics.HighestZeroCount = zeroCount
+			log.Printf("Updated highest zero count to %d", zeroCount)
+		}
+
+		// Update max/min zeros
+		if uint32(zeroCount) > metrics.MaxZeros {
+			metrics.MaxZeros = uint32(zeroCount)
+		}
+		if metrics.MinZeros == 0 || uint32(zeroCount) < metrics.MinZeros {
+			metrics.MinZeros = uint32(zeroCount)
+		}
+		p.mu.Unlock()
+
+		log.Printf("Updated work metrics for block %d: farmer=%s, zeros=%d, highestZeroCount=%d",
+			blockIndex, farmerAddr, zeroCount, metrics.HighestZeroCount)
 
 	case "harvest":
-		// Try to extract farmer address for harvest metrics
-		farmerAddr := extractFarmerAddress(data)
-		p.updateHarvestMetrics(metrics, data, farmerAddr)
+		// Extract reward amount
+		rewardAmount := int64(0)
 
-	default:
-		log.Printf("No specific metric update for event type: %s", eventType)
+		// First try SorobanMeta events
+		if sorobanMeta, ok := data["soroban_meta"].(map[string]interface{}); ok {
+			log.Printf("Soroban meta structure: %s", prettyPrint(sorobanMeta))
+
+			// Look for mint event in Events
+			if events, ok := sorobanMeta["Events"].([]interface{}); ok {
+				for _, event := range events {
+					eventMap, ok := event.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					if body, ok := eventMap["Body"].(map[string]interface{}); ok {
+						if v0, ok := body["V0"].(map[string]interface{}); ok {
+							if topics, ok := v0["Topics"].([]interface{}); ok && len(topics) > 0 {
+								// Look for mint event
+								topicMap, ok := topics[0].(map[string]interface{})
+								if !ok {
+									continue
+								}
+
+								if sym, ok := topicMap["Sym"].(string); ok && sym == "mint" {
+									// Extract amount from data
+									if eventData, ok := v0["Data"].(map[string]interface{}); ok {
+										if i128, ok := eventData["I128"].(map[string]interface{}); ok {
+											if lo, ok := i128["Lo"].(float64); ok {
+												rewardAmount = int64(lo)
+												log.Printf("Extracted reward amount %d from mint event", rewardAmount)
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// If no event found, try ReturnValue
+			if rewardAmount == 0 {
+				if returnVal, ok := sorobanMeta["ReturnValue"].(map[string]interface{}); ok {
+					if i128, ok := returnVal["I128"].(map[string]interface{}); ok {
+						if lo, ok := i128["Lo"].(float64); ok {
+							rewardAmount = int64(lo)
+							log.Printf("Extracted reward amount %d from SorobanMeta ReturnValue", rewardAmount)
+						}
+					}
+				}
+			}
+		}
+
+		// Update metrics with harvest data
+		p.mu.Lock()
+		if !contains(metrics.Farmers, farmerAddr) {
+			metrics.Farmers = append(metrics.Farmers, farmerAddr)
+			metrics.Participants = len(metrics.Farmers)
+		}
+
+		// Update rewards
+		metrics.FarmerRewards[farmerAddr] = rewardAmount
+		metrics.TotalReward += rewardAmount
+
+		// Set close time if not already set
+		if metrics.CloseTimeMs == 0 {
+			metrics.CloseTimeMs = time.Now().UnixMilli()
+
+			// Calculate duration if open time is set
+			if metrics.OpenTimeMs > 0 {
+				metrics.Duration = metrics.CloseTimeMs - metrics.OpenTimeMs
+				log.Printf("Calculated duration %d ms for block %d", metrics.Duration, blockIndex)
+			}
+		}
+		p.mu.Unlock()
+
+		log.Printf("Updated harvest metrics for block %d: farmer=%s, reward=%d, totalReward=%d",
+			blockIndex, farmerAddr, rewardAmount, metrics.TotalReward)
 	}
 
 	// Forward to consumers
-	if err := p.forwardToConsumers(context.Background(), metrics); err != nil {
-		log.Printf("Error forwarding %s metrics to consumers: %v", eventType, err)
+	log.Printf("Forwarding metrics for block %d to consumers", blockIndex)
+	if err := p.forwardToConsumers(ctx, metrics); err != nil {
+		log.Printf("Error forwarding metrics to consumers: %v", err)
+	} else {
+		log.Printf("Successfully forwarded metrics for block %d to consumers", blockIndex)
 	}
+
+	// Store updated block indices for retrieval
+	p.mu.Lock()
+	p.stats.LastBlockIndex = blockIndex
+	p.stats.LastUpdated = time.Now()
+	p.mu.Unlock()
 }
 
-// extractFarmerAddress attempts to extract a farmer address from event data
-func extractFarmerAddress(data map[string]interface{}) string {
-	// Try common field names
-	for _, key := range []string{"farmerAddr", "farmer", "address", "public_key"} {
-		if val, ok := data[key]; ok {
-			if strVal, ok := val.(string); ok {
-				log.Printf("Extracted farmer address '%s' from field %s", strVal, key)
-				return strVal
-			}
-		}
+// Helper function to get transaction hash from data
+func getTransactionHash(data map[string]interface{}) string {
+	if hash, ok := data["transaction_hash"].(string); ok {
+		return hash
 	}
-
-	// Try from arguments
-	if args, ok := data["arguments"].([]interface{}); ok && len(args) > 0 {
-		if farmerArg, ok := args[0].(string); ok {
-			log.Printf("Extracted farmer address '%s' from first argument", farmerArg)
-			return farmerArg
-		}
-	}
-
-	log.Printf("Could not extract farmer address, using 'unknown'")
-	return "unknown"
+	return ""
 }

@@ -128,9 +128,17 @@ func countLeadingZeros(s string) uint32 {
 	return count
 }
 
-// max returns the maximum of two uint32 values
-func max(a, b uint32) uint32 {
+// max returns the larger of two uint32 values
+func maxUint32(a, b uint32) uint32 {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+// min returns the smaller of two uint32 values
+func minUint32(a, b uint32) uint32 {
+	if a < b {
 		return a
 	}
 	return b

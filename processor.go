@@ -96,14 +96,26 @@ func (p *KaleMetricsProcessor) ProcessEventMessage(ctx context.Context, contract
 	contractID, ok := contractEvent["contract_id"].(string)
 	if !ok || contractID != p.contractID {
 		return NewProcessorError(
-			fmt.Errorf("event is not from target contract: expected %s, got %s", p.contractID, contractID),
+			fmt.Errorf("event is not for target contract: expected %s, got %s", p.contractID, contractID),
 			ErrorTypeProcessing,
 			ErrorSeverityWarning,
 		).WithContract(contractID)
 	}
 
 	log.Printf("Processing event from Kale contract: %s", contractID)
-	err := p.processEventMessage(ctx, contractEvent)
+
+	// Serialize the contract event to JSON
+	eventJSON, err := json.Marshal(contractEvent)
+	if err != nil {
+		return NewProcessorError(
+			fmt.Errorf("error serializing contract event: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityError,
+		).WithContract(contractID)
+	}
+
+	// Call the updated processEventMessage method with byte array
+	err = p.processEventMessage(ctx, eventJSON)
 
 	if err != nil {
 		// If it's already a ProcessorError, return it as is
@@ -150,7 +162,19 @@ func (p *KaleMetricsProcessor) ProcessInvocationMessage(ctx context.Context, inv
 	}
 
 	log.Printf("Processing invocation for Kale contract: %s", contractID)
-	err := p.processInvocationMessage(ctx, invocation)
+
+	// Serialize the invocation to JSON
+	invocationJSON, err := json.Marshal(invocation)
+	if err != nil {
+		return NewProcessorError(
+			fmt.Errorf("error serializing invocation: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityError,
+		).WithContract(contractID)
+	}
+
+	// Call the updated processInvocationMessage method with byte array
+	err = p.processInvocationMessage(ctx, invocationJSON)
 
 	if err != nil {
 		// If it's already a ProcessorError, return it as is
