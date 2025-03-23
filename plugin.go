@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -233,9 +236,17 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 			return nil // Skip if not our target contract
 		}
 
-		// Check if function name is harvest
-		if functionName, ok := data["function_name"].(string); ok && functionName == "harvest" {
-			// For harvest functions, try to find the Kale block index in the arguments
+		// Get function name
+		functionName, ok := data["function_name"].(string)
+		if !ok {
+			log.Printf("Function name not found in invocation data")
+			return err
+		}
+
+		log.Printf("Processing %s function invocation for forwarding metrics", functionName)
+
+		// For harvest function, extract block index from arguments
+		if functionName == "harvest" {
 			if args, ok := data["arguments"].([]interface{}); ok && len(args) >= 2 {
 				if arg, ok := args[1].(map[string]interface{}); ok {
 					if u32Val, ok := arg["U32"].(float64); ok {
@@ -262,46 +273,13 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 					}
 				}
 			}
-		} else if functionName, ok := data["function_name"].(string); ok && functionName == "plant" {
-			// For plant functions, we need to look in the temporary data for the block index
+		} else if functionName == "plant" {
+			// For plant functions, we need to look in the transaction data for the Pail entries
 
-			// Check if we have diagnostic events or transaction meta that contains temporary data
-			var blockIndex uint32
-			var foundBlockIndex bool
+			// Get or create metrics for the correct block index
+			blockIndex, found := findPailBlockIndex(data)
 
-			// First check in TxChangesBefore or TxChangesAfter for temporary data with Pail key
-			if txMeta, ok := data["soroban_meta"].(map[string]interface{}); ok {
-				// Search in TxChangesBefore
-				if changes, ok := txMeta["TxChangesBefore"].([]interface{}); ok {
-					blockIndex, foundBlockIndex = extractBlockIndexFromChanges(changes)
-				}
-
-				// If not found, search in TxChangesAfter
-				if !foundBlockIndex {
-					if changes, ok := txMeta["TxChangesAfter"].([]interface{}); ok {
-						blockIndex, foundBlockIndex = extractBlockIndexFromChanges(changes)
-					}
-				}
-
-				// If not found, search in Operations
-				if !foundBlockIndex {
-					if operations, ok := txMeta["Operations"].([]interface{}); ok {
-						for _, op := range operations {
-							if opMap, ok := op.(map[string]interface{}); ok {
-								if changes, ok := opMap["Changes"].([]interface{}); ok {
-									blockIndex, foundBlockIndex = extractBlockIndexFromChanges(changes)
-									if foundBlockIndex {
-										break
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// If we found a block index in the temporary data
-			if foundBlockIndex {
+			if found {
 				log.Printf("Using Kale block index %d from 'plant' temporary data for forwarding metrics", blockIndex)
 
 				// Get the metrics for this block and forward to plugin consumers
@@ -320,6 +298,12 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 					log.Printf("No metrics found for Kale block index %d", blockIndex)
 				}
 				return nil
+			} else {
+				log.Printf("Could not find Pail block index in plant invocation data, dumping available fields")
+				// Log the top-level fields to help debug
+				for k := range data {
+					log.Printf("  Field: %s", k)
+				}
 			}
 		}
 
@@ -353,59 +337,123 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 	return err
 }
 
-// extractBlockIndexFromChanges searches for a block index in temporary data entries
+// extractBlockIndexFromChanges searches for block index in transaction changes
 func extractBlockIndexFromChanges(changes []interface{}) (uint32, bool) {
+	log.Printf("Searching for block index in %d changes", len(changes))
+
 	for _, change := range changes {
 		changeMap, ok := change.(map[string]interface{})
 		if !ok {
 			continue
 		}
 
-		// Look for Created or Updated entries
-		var stateData map[string]interface{}
-		if created, ok := changeMap["Created"].(map[string]interface{}); ok {
-			stateData = created
-		} else if updated, ok := changeMap["Updated"].(map[string]interface{}); ok {
-			stateData = updated
-		} else if state, ok := changeMap["State"].(map[string]interface{}); ok {
-			stateData = state
+		// Check for temporary entry with key containing "Pail"
+		if entryType, ok := changeMap["type"].(string); ok && entryType == "temporary" {
+			log.Printf("Found temporary entry: %+v", changeMap)
+
+			// Look for key field
+			if key, ok := changeMap["key"].(string); ok && strings.Contains(key, "Pail") {
+				log.Printf("Found Pail key: %s", key)
+
+				// Check for value field
+				if valueData, ok := changeMap["value"].(map[string]interface{}); ok {
+					// Try to extract from various formats
+					if strVal, ok := valueData["String"].(string); ok {
+						// Try to find a 5-digit number in the string
+						re := regexp.MustCompile(`\b(\d{5})\b`)
+						matches := re.FindStringSubmatch(strVal)
+						if len(matches) > 1 {
+							if num, err := strconv.ParseUint(matches[1], 10, 32); err == nil {
+								log.Printf("Extracted block index %d from String value", num)
+								return uint32(num), true
+							}
+						}
+					} else if u32Val, ok := valueData["U32"].(float64); ok {
+						log.Printf("Extracted block index %d from U32 value", uint32(u32Val))
+						return uint32(u32Val), true
+					} else if data, ok := valueData["Vec"].([]interface{}); ok && len(data) > 0 {
+						log.Printf("Examining Vec data: %+v", data)
+
+						// Look for a U32 value in the Vec elements
+						for _, elem := range data {
+							if elemMap, ok := elem.(map[string]interface{}); ok {
+								if u32Val, ok := elemMap["U32"].(float64); ok {
+									log.Printf("Extracted block index %d from Vec element", uint32(u32Val))
+									return uint32(u32Val), true
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 
-		if stateData == nil {
-			continue
-		}
+		// Look in ledger entry data
+		if dataField, ok := changeMap["data"].(map[string]interface{}); ok {
+			// Check if this is a LedgerEntry with Pail data
+			if xdr, ok := dataField["xdr"].(string); ok && strings.Contains(xdr, "Pail") {
+				log.Printf("Found Pail reference in ledger entry XDR: %s", xdr)
 
-		// Extract Data from state
-		var data map[string]interface{}
-		if dataObj, ok := stateData["Data"].(map[string]interface{}); ok {
-			data = dataObj
+				// Try to extract a number that might be the block index
+				re := regexp.MustCompile(`\b(\d{5})\b`) // Look for 5-digit numbers
+				matches := re.FindStringSubmatch(xdr)
+				if len(matches) > 1 {
+					if num, err := strconv.ParseUint(matches[1], 10, 32); err == nil {
+						log.Printf("Extracted block index %d from ledger entry", num)
+						return uint32(num), true
+					}
+				}
+			}
 		}
+	}
 
-		if data == nil {
-			continue
-		}
+	return 0, false
+}
 
-		// Look for ContractData entries
-		var contractData map[string]interface{}
-		if cd, ok := data["ContractData"].(map[string]interface{}); ok {
-			contractData = cd
-		}
+// findPailBlockIndex attempts to find the Kale block index in Pail entries
+func findPailBlockIndex(data map[string]interface{}) (uint32, bool) {
+	// First log more details about what we're working with
+	log.Printf("Looking for Pail block index in data with %d top-level fields", len(data))
+	for field, value := range data {
+		log.Printf("Top-level field: %s (type: %T)", field, value)
 
-		if contractData == nil {
-			continue
-		}
+		// If the field contains "temporary" and it's a list, let's check it closely
+		if strings.Contains(strings.ToLower(field), "temp") {
+			log.Printf("Examining field %s for Pail data", field)
+			if tempData, ok := value.([]interface{}); ok {
+				log.Printf("Found temporary data array with %d entries", len(tempData))
+				for i, entry := range tempData {
+					log.Printf("Temporary data entry %d: %+v", i, entry)
+					if entryMap, ok := entry.(map[string]interface{}); ok {
+						// Check for Pail in key field
+						if key, ok := entryMap["key"].(string); ok {
+							log.Printf("Entry key: %s", key)
+							if strings.Contains(key, "Pail") {
+								log.Printf("Found Pail in temporary data key: %s", key)
 
-		// Check if Key contains a Vec with "Pail" symbol
-		if key, ok := contractData["Key"].(map[string]interface{}); ok {
-			if vec, ok := key["Vec"].([]interface{}); ok && len(vec) >= 3 {
-				// Check if first element is "Pail" symbol
-				if firstElem, ok := vec[0].(map[string]interface{}); ok {
-					if sym, ok := firstElem["Sym"].(string); ok && sym == "Pail" {
-						// The third element should be the block index
-						if thirdElem, ok := vec[2].(map[string]interface{}); ok {
-							if u32Val, ok := thirdElem["U32"].(float64); ok {
-								log.Printf("Found Kale block index %d in 'Pail' temporary data", uint32(u32Val))
-								return uint32(u32Val), true
+								// Check the value field
+								if value, ok := entryMap["value"].(map[string]interface{}); ok {
+									log.Printf("Examining value: %+v", value)
+
+									// Look for U32 field
+									if u32Val, ok := value["U32"].(float64); ok {
+										log.Printf("Found U32 block index: %f", u32Val)
+										return uint32(u32Val), true
+									}
+
+									// Look for String field that might contain a number
+									if strVal, ok := value["String"].(string); ok {
+										log.Printf("Found String value: %s", strVal)
+										re := regexp.MustCompile(`\b(\d{5})\b`)
+										matches := re.FindStringSubmatch(strVal)
+										if len(matches) > 1 {
+											if num, err := strconv.ParseUint(matches[1], 10, 32); err == nil {
+												log.Printf("Extracted block index %d from String", num)
+												return uint32(num), true
+											}
+										}
+									}
+								}
 							}
 						}
 					}
@@ -414,7 +462,183 @@ func extractBlockIndexFromChanges(changes []interface{}) (uint32, bool) {
 		}
 	}
 
+	// Potential field names for transaction metadata
+	metaFieldNames := []string{"soroban_meta", "meta", "tx_meta", "transaction_meta", "diagnostic_events", "temporary_data"}
+
+	// Try each possible field name
+	for _, fieldName := range metaFieldNames {
+		metaData, ok := data[fieldName]
+		if !ok {
+			continue
+		}
+
+		log.Printf("Examining %s field for Pail data", fieldName)
+
+		// Process based on field type - it could be a map or a list
+		switch meta := metaData.(type) {
+		case map[string]interface{}:
+			// Search within this map for relevant entries
+			blockIndex, found := searchForPailInMap(meta)
+			if found {
+				return blockIndex, true
+			}
+
+		case []interface{}:
+			// Search within this list for relevant entries
+			for _, item := range meta {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					blockIndex, found := searchForPailInMap(itemMap)
+					if found {
+						return blockIndex, true
+					}
+				}
+
+				// It could also be directly a string containing the Pail entry
+				if str, ok := item.(string); ok {
+					if contains := strings.Contains(str, "Pail"); contains {
+						log.Printf("Found Pail reference in string: %s", str)
+						// Try to extract a number that might be the block index
+						re := regexp.MustCompile(`\b(\d{5})\b`) // Look for 5-digit numbers (typical block indices)
+						matches := re.FindStringSubmatch(str)
+						if len(matches) > 1 {
+							if num, err := strconv.ParseUint(matches[1], 10, 32); err == nil {
+								log.Printf("Extracted potential block index %d from string", num)
+								return uint32(num), true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// As a last attempt, convert the entire payload to string and search for Pail nearby numbers
+	payloadBytes, err := json.Marshal(data)
+	if err == nil {
+		payload := string(payloadBytes)
+		log.Printf("Searching for 'Pail' in full payload of length %d", len(payload))
+
+		pailIndex := strings.Index(payload, "Pail")
+		if pailIndex >= 0 {
+			// Look for a 5-digit number near the "Pail" occurrence (search both before and after)
+			log.Printf("Found 'Pail' in payload at position %d", pailIndex)
+
+			// Look before and after the occurrence
+			startPos := max(0, pailIndex-100)
+			endPos := min(len(payload), pailIndex+200)
+			searchArea := payload[startPos:endPos]
+
+			// Try different regex patterns for block index
+			patterns := []string{
+				`"U32":(\d{5})`,         // "U32":12345
+				`"key":"Pail.*?(\d{5})`, // "key":"Pail...12345
+				`Pail.{1,50}?(\d{5})`,   // Pail followed by up to 50 chars then 5 digits
+				`(\d{5}).{1,50}?Pail`,   // 5 digits followed by up to 50 chars then Pail
+				`"key":"[^"]*?(\d{5})`,  // Any key with 5 digits
+				`"value":[^{]*?(\d{5})`, // Any value with 5 digits
+			}
+
+			for _, pattern := range patterns {
+				re := regexp.MustCompile(pattern)
+				matches := re.FindStringSubmatch(searchArea)
+				if len(matches) > 1 {
+					if num, err := strconv.ParseUint(matches[1], 10, 32); err == nil {
+						log.Printf("Extracted block index %d using pattern %s", num, pattern)
+						return uint32(num), true
+					}
+				}
+			}
+		}
+	}
+
+	// Couldn't find the block index
+	log.Printf("Failed to find Pail block index in any field")
 	return 0, false
+}
+
+// searchForPailInMap recursively searches a map for Pail entries and extracts the block index
+func searchForPailInMap(data map[string]interface{}) (uint32, bool) {
+	// Check all keys for "Pail" or related terms
+	for key, value := range data {
+		// Check if this key indicates a Pail entry
+		if strings.Contains(strings.ToLower(key), "pail") {
+			log.Printf("Found key containing 'pail': %s", key)
+
+			// If value is a map, look for U32 field
+			if valMap, ok := value.(map[string]interface{}); ok {
+				if u32Val, ok := valMap["U32"].(float64); ok {
+					log.Printf("Found block index %d in Pail value", uint32(u32Val))
+					return uint32(u32Val), true
+				}
+			}
+		}
+
+		// Handle Vec arrays that might contain Pail
+		if key == "Vec" {
+			if vec, ok := value.([]interface{}); ok && len(vec) >= 3 {
+				// Check if first element has Sym=Pail
+				if firstElem, ok := vec[0].(map[string]interface{}); ok {
+					if sym, ok := firstElem["Sym"].(string); ok && sym == "Pail" {
+						// The third element might have the U32 block index
+						if thirdElem, ok := vec[2].(map[string]interface{}); ok {
+							if u32Val, ok := thirdElem["U32"].(float64); ok {
+								log.Printf("Found block index %d in Vec array with Pail entry", uint32(u32Val))
+								return uint32(u32Val), true
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Check if this is a Changes array, SorobanMeta, Operations, etc.
+		if keysToCheck := []string{"Changes", "TxChangesBefore", "TxChangesAfter", "Operations", "SorobanMeta", "Events"}; contains(keysToCheck, key) {
+			if changes, ok := value.([]interface{}); ok {
+				blockIndex, found := extractBlockIndexFromChanges(changes)
+				if found {
+					return blockIndex, true
+				}
+			}
+		}
+
+		// Recursively check nested maps
+		if nestedMap, ok := value.(map[string]interface{}); ok {
+			blockIndex, found := searchForPailInMap(nestedMap)
+			if found {
+				return blockIndex, true
+			}
+		}
+
+		// Recursively check arrays
+		if arr, ok := value.([]interface{}); ok {
+			for _, item := range arr {
+				if itemMap, ok := item.(map[string]interface{}); ok {
+					blockIndex, found := searchForPailInMap(itemMap)
+					if found {
+						return blockIndex, true
+					}
+				}
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// max returns the maximum of two integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // forwardToPluginConsumers forwards messages to all registered plugin consumers
