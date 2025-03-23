@@ -1,7 +1,7 @@
 github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
 github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
-github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4 h1:t+rjWVnE/S886yqdvmsx5fvXgG9LDuu6SIDXEDGVfIc=
-github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4/go.mod h1:pIh0xYFVnaMP9fLnjFT7URY9Zhwy5wuc6tQkYybKkUY=
+github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=
+github.com/google/go-cmp v0.6.0/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
 github.com/withObsrvr/pluginapi v0.0.0-20250303141549-e645e333195c h1:iVGI7G6xuvCUsy3E7Q+tOxu59yL21nHzpmK1T5cPsWg=
 github.com/withObsrvr/pluginapi v0.0.0-20250303141549-e645e333195c/go.mod h1:pmxJBcOqhV1tvkkVF2qatGW9NvvoqcHbRbLwpw/OzKA=
 google.golang.org/protobuf v1.36.5 h1:tPhr+woSbjfYvY6/GPufUoYizxw1cF/yFoxJ2fmpwlM=
