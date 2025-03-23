@@ -158,13 +158,73 @@ func (p *KaleMetricsPlugin) Process(ctx context.Context, msg pluginapi.Message) 
 
 // processEvent handles contract event messages and updates statistics
 func (p *KaleMetricsPlugin) processEvent(ctx context.Context, data map[string]interface{}) error {
+	// First, let the processor handle the event
 	err := p.processor.ProcessEventMessage(ctx, data)
+
+	// After processing, check if we need to forward metrics to plugin consumers
+	if err == nil && len(p.consumers) > 0 {
+		// Get the block index from the event data
+		var blockIndex uint32
+		if blockIndexFloat, ok := data["block_index"].(float64); ok {
+			blockIndex = uint32(blockIndexFloat)
+		} else if blockIndexFloat, ok := data["ledger_sequence"].(float64); ok {
+			// Fallback to ledger sequence if block index is not available
+			blockIndex = uint32(blockIndexFloat)
+		}
+
+		if blockIndex > 0 {
+			// Get the metrics for this block and forward to plugin consumers
+			metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+			if getErr == nil && metrics != nil {
+				p.mu.RLock()
+				consumers := make([]pluginapi.Consumer, len(p.consumers))
+				copy(consumers, p.consumers)
+				p.mu.RUnlock()
+
+				// Forward the metrics to plugin consumers
+				if forwardErr := p.processor.forwardToPluginConsumers(ctx, metrics, consumers); forwardErr != nil {
+					log.Printf("Error forwarding metrics to plugin consumers: %v", forwardErr)
+				}
+			}
+		}
+	}
+
 	return err
 }
 
 // processInvocation handles contract invocation messages and updates statistics
 func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[string]interface{}) error {
+	// First, let the processor handle the invocation
 	err := p.processor.ProcessInvocationMessage(ctx, data)
+
+	// After processing, check if we need to forward metrics to plugin consumers
+	if err == nil && len(p.consumers) > 0 {
+		// Get the block index from the invocation data
+		var blockIndex uint32
+		if blockIndexFloat, ok := data["block_index"].(float64); ok {
+			blockIndex = uint32(blockIndexFloat)
+		} else if blockIndexFloat, ok := data["ledger_sequence"].(float64); ok {
+			// Fallback to ledger sequence if block index is not available
+			blockIndex = uint32(blockIndexFloat)
+		}
+
+		if blockIndex > 0 {
+			// Get the metrics for this block and forward to plugin consumers
+			metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+			if getErr == nil && metrics != nil {
+				p.mu.RLock()
+				consumers := make([]pluginapi.Consumer, len(p.consumers))
+				copy(consumers, p.consumers)
+				p.mu.RUnlock()
+
+				// Forward the metrics to plugin consumers
+				if forwardErr := p.processor.forwardToPluginConsumers(ctx, metrics, consumers); forwardErr != nil {
+					log.Printf("Error forwarding metrics to plugin consumers: %v", forwardErr)
+				}
+			}
+		}
+	}
+
 	return err
 }
 
@@ -304,4 +364,41 @@ func (p *KaleMetricsPlugin) RegisterConsumer(consumer pluginapi.Consumer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.consumers = append(p.consumers, consumer)
+
+	// Forward existing metrics to the new consumer, if any
+	if len(p.processor.blockMetrics) > 0 {
+		go func() {
+			ctx := context.Background()
+			log.Printf("Forwarding existing metrics to newly registered consumer %s", consumer.Name())
+
+			p.processor.mu.RLock()
+			metrics := p.processor.GetAllBlockMetrics()
+			p.processor.mu.RUnlock()
+
+			for _, metric := range metrics {
+				metricsJSON, err := json.Marshal(metric)
+				if err != nil {
+					log.Printf("Error marshaling metrics for block %d: %v", metric.BlockIndex, err)
+					continue
+				}
+
+				msg := pluginapi.Message{
+					Payload:   metricsJSON,
+					Timestamp: time.Now(),
+					Metadata: map[string]interface{}{
+						"block_index": metric.BlockIndex,
+						"type":        "kale_block_metrics",
+					},
+				}
+
+				if err := consumer.Process(ctx, msg); err != nil {
+					log.Printf("Error forwarding existing metrics for block %d to new consumer %s: %v",
+						metric.BlockIndex, consumer.Name(), err)
+				} else {
+					log.Printf("Successfully forwarded existing metrics for block %d to new consumer %s",
+						metric.BlockIndex, consumer.Name())
+				}
+			}
+		}()
+	}
 }

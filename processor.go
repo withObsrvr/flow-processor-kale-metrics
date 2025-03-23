@@ -303,3 +303,62 @@ func (p *KaleMetricsProcessor) forwardToConsumers(ctx context.Context, metrics *
 
 	return nil
 }
+
+// forwardToPluginConsumers forwards metrics to plugin-level consumers
+func (p *KaleMetricsProcessor) forwardToPluginConsumers(ctx context.Context, metrics *KaleBlockMetrics, pluginConsumers []pluginapi.Consumer) error {
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled before forwarding to plugin consumers: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		)
+	}
+
+	if len(pluginConsumers) == 0 {
+		log.Printf("No plugin consumers registered, skipping forwarding to plugin")
+		return nil
+	}
+
+	log.Printf("Forwarding metrics for block %d to %d plugin consumers", metrics.BlockIndex, len(pluginConsumers))
+
+	// Convert metrics to JSON
+	metricsJSON, err := json.Marshal(metrics)
+	if err != nil {
+		return NewProcessorError(
+			fmt.Errorf("error marshaling metrics to JSON: %w", err),
+			ErrorTypeParsing,
+			ErrorSeverityError,
+		).WithBlock(metrics.BlockIndex)
+	}
+
+	// Create a message to send to consumers
+	msg := pluginapi.Message{
+		Payload:   metricsJSON,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"block_index": metrics.BlockIndex,
+			"type":        "kale_block_metrics",
+		},
+	}
+
+	// Forward to each plugin consumer
+	var forwardErrors []error
+	for _, consumer := range pluginConsumers {
+		if err := consumer.Process(ctx, msg); err != nil {
+			log.Printf("Error forwarding metrics to plugin consumer %s: %v", consumer.Name(), err)
+			forwardErrors = append(forwardErrors, err)
+		} else {
+			log.Printf("Successfully forwarded metrics to plugin consumer %s", consumer.Name())
+		}
+	}
+
+	if len(forwardErrors) > 0 {
+		return NewProcessorError(
+			fmt.Errorf("failed to forward metrics to %d out of %d plugin consumers", len(forwardErrors), len(pluginConsumers)),
+			ErrorTypeNetwork,
+			ErrorSeverityWarning,
+		).WithBlock(metrics.BlockIndex).WithContext("error_count", len(forwardErrors))
+	}
+
+	return nil
+}
