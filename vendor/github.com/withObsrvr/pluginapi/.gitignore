@@ -7,7 +7,6 @@
 *.dll
 *.so
 *.dylib
-flow-processor-kale-metrics
 
 # Test binary, built with `go test -c`
 *.test
@@ -24,22 +23,3 @@ go.work.sum
 
 # env file
 .env
-kale-sc.md
-
-# Nix
-result
-result/
-.direnv/
-
-# IDE files
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Backup files
-*.bak
-*.orig
-
-# Plugin files
-plugins/
