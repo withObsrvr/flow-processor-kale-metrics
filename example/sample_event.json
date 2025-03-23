@@ -1,0 +1,14 @@
+{
+  "topic": [
+    {
+      "Symbol": "plant"
+    }
+  ],
+  "data": {
+    "farmer": "G5EAPH4IFMMRW5CVHW4J5WEJZ7UKTKEHBMPGPNUFMKRQNMJLVDNQ",
+    "stake": 1000000000,
+    "index": 12345
+  },
+  "ledger_sequence": 12345,
+  "transaction_hash": "abcdef1234567890"
+} 

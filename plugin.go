@@ -1,0 +1,256 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/withObsrvr/pluginapi"
+)
+
+// KaleMetricsPlugin implements the pluginapi.Plugin interface
+type KaleMetricsPlugin struct {
+	processor *KaleMetricsProcessor
+	mu        sync.RWMutex
+	stats     struct {
+		ProcessedEvents      uint64
+		ProcessedInvocations uint64
+		FailedEvents         uint64
+		FailedInvocations    uint64
+		LastProcessedTime    time.Time
+	}
+	startTime  time.Time
+	contractID string
+}
+
+// NewPlugin creates a new KaleMetricsPlugin
+func NewPlugin() *KaleMetricsPlugin {
+	return &KaleMetricsPlugin{
+		processor: NewKaleMetricsProcessor(),
+		startTime: time.Now(),
+	}
+}
+
+// Name returns the name of the plugin
+func (p *KaleMetricsPlugin) Name() string {
+	return "flow/processor/kale-metrics"
+}
+
+// Description returns a description of the plugin
+func (p *KaleMetricsPlugin) Description() string {
+	return "Extracts metrics from Kale contract events and invocations"
+}
+
+// Version returns the version of the plugin
+func (p *KaleMetricsPlugin) Version() string {
+	return "1.0.0"
+}
+
+// Type returns the type of the plugin
+func (p *KaleMetricsPlugin) Type() pluginapi.PluginType {
+	return pluginapi.ProcessorPlugin
+}
+
+// Process implements the Processor interface
+func (p *KaleMetricsPlugin) Process(ctx context.Context, msg pluginapi.Message) error {
+	// Check for context cancellation
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled before processing: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		)
+	}
+
+	log.Printf("KaleMetricsPlugin.Process called with message metadata: %+v", msg.Metadata)
+
+	// Get the message type from metadata
+	msgType, ok := msg.Metadata["type"].(string)
+	if !ok {
+		log.Printf("Message type not found in metadata, trying to determine from payload")
+		// Try to determine message type from payload structure
+		payloadBytes, ok := msg.Payload.([]byte)
+		if !ok {
+			return NewProcessorError(
+				fmt.Errorf("message payload is not a byte slice"),
+				ErrorTypeParsing,
+				ErrorSeverityError,
+			)
+		}
+
+		var data map[string]interface{}
+		if err := json.Unmarshal(payloadBytes, &data); err != nil {
+			return NewProcessorError(
+				fmt.Errorf("failed to unmarshal message data: %w", err),
+				ErrorTypeParsing,
+				ErrorSeverityError,
+			)
+		}
+
+		// Check for fields that indicate event vs invocation
+		if _, hasTopics := data["topic"]; hasTopics {
+			msgType = "contract_event"
+		} else if _, hasFunction := data["function_name"]; hasFunction {
+			msgType = "contract_invocation"
+		} else {
+			log.Printf("Could not determine message type from payload, skipping")
+			return nil
+		}
+	}
+
+	log.Printf("Processing message of type: %s", msgType)
+
+	// Parse the message data
+	var data map[string]interface{}
+	payloadBytes, ok := msg.Payload.([]byte)
+	if !ok {
+		return NewProcessorError(
+			fmt.Errorf("message payload is not a byte slice"),
+			ErrorTypeParsing,
+			ErrorSeverityError,
+		)
+	}
+
+	if err := json.Unmarshal(payloadBytes, &data); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("failed to unmarshal message data: %w", err),
+			ErrorTypeParsing,
+			ErrorSeverityError,
+		)
+	}
+
+	// Check if this event is for our target contract
+	if p.contractID != "" {
+		if contractID, ok := data["contract_id"].(string); ok && contractID != p.contractID {
+			log.Printf("Message is not for our target contract %s (got %s), skipping", p.contractID, contractID)
+			return nil
+		}
+	}
+
+	var err error
+
+	// Process the message based on its type
+	switch msgType {
+	case "contract_event":
+		err = p.processEvent(ctx, data)
+	case "contract_invocation":
+		err = p.processInvocation(ctx, data)
+	default:
+		log.Printf("Unsupported message type: %s", msgType)
+		return nil // Skip unsupported message types
+	}
+
+	// Record processing statistics
+	p.recordProcessing(msgType, err == nil)
+
+	return err
+}
+
+// processEvent handles contract event messages and updates statistics
+func (p *KaleMetricsPlugin) processEvent(ctx context.Context, data map[string]interface{}) error {
+	err := p.processor.ProcessEventMessage(ctx, data)
+	return err
+}
+
+// processInvocation handles contract invocation messages and updates statistics
+func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[string]interface{}) error {
+	err := p.processor.ProcessInvocationMessage(ctx, data)
+	return err
+}
+
+// recordProcessing updates statistics based on message type and success
+func (p *KaleMetricsPlugin) recordProcessing(msgType string, success bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.stats.LastProcessedTime = time.Now()
+
+	if msgType == "contract_event" {
+		if success {
+			p.stats.ProcessedEvents++
+		} else {
+			p.stats.FailedEvents++
+		}
+	} else if msgType == "contract_invocation" {
+		if success {
+			p.stats.ProcessedInvocations++
+		} else {
+			p.stats.FailedInvocations++
+		}
+	}
+}
+
+// GetStatus returns the operational status of the plugin
+func (p *KaleMetricsPlugin) GetStatus() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return map[string]interface{}{
+		"stats": map[string]interface{}{
+			"processed_events":      p.stats.ProcessedEvents,
+			"processed_invocations": p.stats.ProcessedInvocations,
+			"failed_events":         p.stats.FailedEvents,
+			"failed_invocations":    p.stats.FailedInvocations,
+			"last_processed_time":   p.stats.LastProcessedTime,
+		},
+		"uptime":        time.Since(p.startTime).String(),
+		"contract_id":   p.contractID,
+		"metrics_count": len(p.processor.blockMetrics),
+	}
+}
+
+// ProcessMessage processes a message from the flow processor (alias for Process)
+func (p *KaleMetricsPlugin) ProcessMessage(ctx context.Context, msg pluginapi.Message) error {
+	return p.Process(ctx, msg)
+}
+
+// Subscribe registers a consumer to receive metrics
+func (p *KaleMetricsPlugin) Subscribe(consumer pluginapi.Processor) {
+	p.processor.Subscribe(consumer)
+}
+
+// Unsubscribe removes a consumer
+func (p *KaleMetricsPlugin) Unsubscribe(consumer pluginapi.Processor) {
+	p.processor.Unsubscribe(consumer)
+}
+
+// Initialize initializes the plugin with the given configuration
+func (p *KaleMetricsPlugin) Initialize(config map[string]interface{}) error {
+	log.Printf("Initializing kale-metrics plugin with config: %+v", config)
+
+	// Extract contract_id from configuration if provided
+	if contractID, ok := config["contract_id"].(string); ok {
+		p.contractID = contractID
+		log.Printf("Set target contract ID to: %s", p.contractID)
+	}
+
+	return p.processor.Initialize(config)
+}
+
+// Init initializes the plugin
+func (p *KaleMetricsPlugin) Init(ctx context.Context, config json.RawMessage) error {
+	log.Printf("Initializing kale-metrics plugin")
+	var configMap map[string]interface{}
+	if err := json.Unmarshal(config, &configMap); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("failed to unmarshal config: %w", err),
+			ErrorTypeConfig,
+			ErrorSeverityFatal,
+		)
+	}
+	return p.Initialize(configMap)
+}
+
+// Close cleans up resources
+func (p *KaleMetricsPlugin) Close() error {
+	log.Printf("Closing kale-metrics plugin after running for %s", time.Since(p.startTime))
+	return nil
+}
+
+// SchemaProvider returns whether the plugin implements the SchemaProvider interface
+func (p *KaleMetricsPlugin) SchemaProvider() bool {
+	return true
+}
