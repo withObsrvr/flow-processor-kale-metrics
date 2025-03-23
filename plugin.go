@@ -262,6 +262,65 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 					}
 				}
 			}
+		} else if functionName, ok := data["function_name"].(string); ok && functionName == "plant" {
+			// For plant functions, we need to look in the temporary data for the block index
+
+			// Check if we have diagnostic events or transaction meta that contains temporary data
+			var blockIndex uint32
+			var foundBlockIndex bool
+
+			// First check in TxChangesBefore or TxChangesAfter for temporary data with Pail key
+			if txMeta, ok := data["soroban_meta"].(map[string]interface{}); ok {
+				// Search in TxChangesBefore
+				if changes, ok := txMeta["TxChangesBefore"].([]interface{}); ok {
+					blockIndex, foundBlockIndex = extractBlockIndexFromChanges(changes)
+				}
+
+				// If not found, search in TxChangesAfter
+				if !foundBlockIndex {
+					if changes, ok := txMeta["TxChangesAfter"].([]interface{}); ok {
+						blockIndex, foundBlockIndex = extractBlockIndexFromChanges(changes)
+					}
+				}
+
+				// If not found, search in Operations
+				if !foundBlockIndex {
+					if operations, ok := txMeta["Operations"].([]interface{}); ok {
+						for _, op := range operations {
+							if opMap, ok := op.(map[string]interface{}); ok {
+								if changes, ok := opMap["Changes"].([]interface{}); ok {
+									blockIndex, foundBlockIndex = extractBlockIndexFromChanges(changes)
+									if foundBlockIndex {
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// If we found a block index in the temporary data
+			if foundBlockIndex {
+				log.Printf("Using Kale block index %d from 'plant' temporary data for forwarding metrics", blockIndex)
+
+				// Get the metrics for this block and forward to plugin consumers
+				metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+				if getErr == nil && metrics != nil {
+					p.mu.RLock()
+					consumers := make([]pluginapi.Consumer, len(p.consumers))
+					copy(consumers, p.consumers)
+					p.mu.RUnlock()
+
+					// Forward the metrics to plugin consumers with the correct Kale block index
+					if forwardErr := p.processor.forwardToPluginConsumers(ctx, metrics, consumers); forwardErr != nil {
+						log.Printf("Error forwarding metrics to plugin consumers: %v", forwardErr)
+					}
+				} else {
+					log.Printf("No metrics found for Kale block index %d", blockIndex)
+				}
+				return nil
+			}
 		}
 
 		// For other invocations or if we couldn't extract the block index from arguments,
@@ -292,6 +351,70 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 	}
 
 	return err
+}
+
+// extractBlockIndexFromChanges searches for a block index in temporary data entries
+func extractBlockIndexFromChanges(changes []interface{}) (uint32, bool) {
+	for _, change := range changes {
+		changeMap, ok := change.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Look for Created or Updated entries
+		var stateData map[string]interface{}
+		if created, ok := changeMap["Created"].(map[string]interface{}); ok {
+			stateData = created
+		} else if updated, ok := changeMap["Updated"].(map[string]interface{}); ok {
+			stateData = updated
+		} else if state, ok := changeMap["State"].(map[string]interface{}); ok {
+			stateData = state
+		}
+
+		if stateData == nil {
+			continue
+		}
+
+		// Extract Data from state
+		var data map[string]interface{}
+		if dataObj, ok := stateData["Data"].(map[string]interface{}); ok {
+			data = dataObj
+		}
+
+		if data == nil {
+			continue
+		}
+
+		// Look for ContractData entries
+		var contractData map[string]interface{}
+		if cd, ok := data["ContractData"].(map[string]interface{}); ok {
+			contractData = cd
+		}
+
+		if contractData == nil {
+			continue
+		}
+
+		// Check if Key contains a Vec with "Pail" symbol
+		if key, ok := contractData["Key"].(map[string]interface{}); ok {
+			if vec, ok := key["Vec"].([]interface{}); ok && len(vec) >= 3 {
+				// Check if first element is "Pail" symbol
+				if firstElem, ok := vec[0].(map[string]interface{}); ok {
+					if sym, ok := firstElem["Sym"].(string); ok && sym == "Pail" {
+						// The third element should be the block index
+						if thirdElem, ok := vec[2].(map[string]interface{}); ok {
+							if u32Val, ok := thirdElem["U32"].(float64); ok {
+								log.Printf("Found Kale block index %d in 'Pail' temporary data", uint32(u32Val))
+								return uint32(u32Val), true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return 0, false
 }
 
 // forwardToPluginConsumers forwards messages to all registered plugin consumers
