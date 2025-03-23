@@ -36,7 +36,7 @@
             # Build as a shared library/plugin
             buildPhase = ''
               runHook preBuild
-              go build -buildmode=plugin -o flow-processor-kale-metrics.so .
+              go build -mod=vendor -buildmode=plugin -o flow-processor-kale-metrics.so .
               runHook postBuild
             '';
 
