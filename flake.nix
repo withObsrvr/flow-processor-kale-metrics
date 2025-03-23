@@ -1,5 +1,5 @@
 {
-  description = "Obsrvr Flow Plugin: Kale Metrics Processor";
+  description = "Obsrvr Flow Plugin: Kale Contract Metrics";
 
   nixConfig = {
     allow-dirty = true;
@@ -36,7 +36,7 @@
             # Build as a shared library/plugin
             buildPhase = ''
               runHook preBuild
-              go build -mod=vendor -buildmode=plugin -o flow-processor-kale-metrics.so .
+              go build -buildmode=plugin -o flow-processor-kale-metrics.so .
               runHook postBuild
             '';
 
@@ -62,7 +62,7 @@
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            go_1_23
+            go_1_21
             pkg-config
             git
             gopls

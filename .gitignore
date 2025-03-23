@@ -9,6 +9,7 @@
 *.dylib
 flow-processor-kale-metrics
 flow-processor-contract-invocations.md
+flow-processor-contract-events.md
 
 # Test binary, built with `go test -c`
 *.test
