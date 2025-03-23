@@ -8,6 +8,7 @@
 *.so
 *.dylib
 flow-processor-kale-metrics
+flow-processor-contract-invocations.md
 
 # Test binary, built with `go test -c`
 *.test

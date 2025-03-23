@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -361,4 +362,22 @@ func (p *KaleMetricsProcessor) forwardToPluginConsumers(ctx context.Context, met
 	}
 
 	return nil
+}
+
+// GetUpdatedBlockIndices returns a sorted list of block indices that have been updated
+func (p *KaleMetricsProcessor) GetUpdatedBlockIndices() []uint32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	indices := make([]uint32, 0, len(p.blockMetrics))
+	for idx := range p.blockMetrics {
+		indices = append(indices, idx)
+	}
+
+	// Sort in ascending order
+	sort.Slice(indices, func(i, j int) bool {
+		return indices[i] < indices[j]
+	})
+
+	return indices
 }

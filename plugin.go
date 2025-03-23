@@ -163,18 +163,46 @@ func (p *KaleMetricsPlugin) processEvent(ctx context.Context, data map[string]in
 
 	// After processing, check if we need to forward metrics to plugin consumers
 	if err == nil && len(p.consumers) > 0 {
-		// Get the block index from the event data
-		var blockIndex uint32
-		if blockIndexFloat, ok := data["block_index"].(float64); ok {
-			blockIndex = uint32(blockIndexFloat)
-		} else if blockIndexFloat, ok := data["ledger_sequence"].(float64); ok {
-			// Fallback to ledger sequence if block index is not available
-			blockIndex = uint32(blockIndexFloat)
+		// Extract the contractID to ensure we're dealing with the target contract
+		contractID, _ := data["contract_id"].(string)
+		if p.contractID != "" && contractID != p.contractID {
+			return nil // Skip if not our target contract
 		}
 
-		if blockIndex > 0 {
-			// Get the metrics for this block and forward to plugin consumers
-			metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+		// Check if we have function_name and it's a harvest function
+		if functionName, ok := data["function_name"].(string); ok && functionName == "harvest" {
+			// For harvest functions, try to find the Kale block index in the arguments
+			if args, ok := data["arguments"].([]interface{}); ok && len(args) >= 2 {
+				if arg, ok := args[1].(map[string]interface{}); ok {
+					if u32Val, ok := arg["U32"].(float64); ok {
+						// This is likely the Kale block index
+						blockIndex := uint32(u32Val)
+						// Get the metrics for this block and forward to plugin consumers
+						metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+						if getErr == nil && metrics != nil {
+							p.mu.RLock()
+							consumers := make([]pluginapi.Consumer, len(p.consumers))
+							copy(consumers, p.consumers)
+							p.mu.RUnlock()
+
+							// Forward the metrics to plugin consumers
+							if forwardErr := p.processor.forwardToPluginConsumers(ctx, metrics, consumers); forwardErr != nil {
+								log.Printf("Error forwarding metrics to plugin consumers: %v", forwardErr)
+							}
+						}
+						return nil
+					}
+				}
+			}
+		}
+
+		// For other events, check if block metrics were created by the processor
+		// Get the latest block metrics that were updated
+		blockIndices := p.processor.GetUpdatedBlockIndices()
+		if len(blockIndices) > 0 {
+			// Use the most recently updated block metrics
+			latestIndex := blockIndices[len(blockIndices)-1]
+			metrics, getErr := p.processor.GetBlockMetrics(latestIndex)
 			if getErr == nil && metrics != nil {
 				p.mu.RLock()
 				consumers := make([]pluginapi.Consumer, len(p.consumers))
@@ -199,18 +227,52 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 
 	// After processing, check if we need to forward metrics to plugin consumers
 	if err == nil && len(p.consumers) > 0 {
-		// Get the block index from the invocation data
-		var blockIndex uint32
-		if blockIndexFloat, ok := data["block_index"].(float64); ok {
-			blockIndex = uint32(blockIndexFloat)
-		} else if blockIndexFloat, ok := data["ledger_sequence"].(float64); ok {
-			// Fallback to ledger sequence if block index is not available
-			blockIndex = uint32(blockIndexFloat)
+		// Extract the contractID to ensure we're dealing with the target contract
+		contractID, _ := data["contract_id"].(string)
+		if p.contractID != "" && contractID != p.contractID {
+			return nil // Skip if not our target contract
 		}
 
-		if blockIndex > 0 {
-			// Get the metrics for this block and forward to plugin consumers
-			metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+		// Check if function name is harvest
+		if functionName, ok := data["function_name"].(string); ok && functionName == "harvest" {
+			// For harvest functions, try to find the Kale block index in the arguments
+			if args, ok := data["arguments"].([]interface{}); ok && len(args) >= 2 {
+				if arg, ok := args[1].(map[string]interface{}); ok {
+					if u32Val, ok := arg["U32"].(float64); ok {
+						// This is likely the Kale block index
+						blockIndex := uint32(u32Val)
+						log.Printf("Using Kale block index %d from harvest arguments for forwarding metrics", blockIndex)
+
+						// Get the metrics for this block and forward to plugin consumers
+						metrics, getErr := p.processor.GetBlockMetrics(blockIndex)
+						if getErr == nil && metrics != nil {
+							p.mu.RLock()
+							consumers := make([]pluginapi.Consumer, len(p.consumers))
+							copy(consumers, p.consumers)
+							p.mu.RUnlock()
+
+							// Forward the metrics to plugin consumers with the correct Kale block index
+							if forwardErr := p.processor.forwardToPluginConsumers(ctx, metrics, consumers); forwardErr != nil {
+								log.Printf("Error forwarding metrics to plugin consumers: %v", forwardErr)
+							}
+						} else {
+							log.Printf("No metrics found for Kale block index %d", blockIndex)
+						}
+						return nil
+					}
+				}
+			}
+		}
+
+		// For other invocations or if we couldn't extract the block index from arguments,
+		// check if block metrics were created by the processor
+		blockIndices := p.processor.GetUpdatedBlockIndices()
+		if len(blockIndices) > 0 {
+			// Use the most recently updated block metrics
+			latestIndex := blockIndices[len(blockIndices)-1]
+			log.Printf("Using most recently updated block index %d for forwarding metrics", latestIndex)
+
+			metrics, getErr := p.processor.GetBlockMetrics(latestIndex)
 			if getErr == nil && metrics != nil {
 				p.mu.RLock()
 				consumers := make([]pluginapi.Consumer, len(p.consumers))
@@ -221,7 +283,11 @@ func (p *KaleMetricsPlugin) processInvocation(ctx context.Context, data map[stri
 				if forwardErr := p.processor.forwardToPluginConsumers(ctx, metrics, consumers); forwardErr != nil {
 					log.Printf("Error forwarding metrics to plugin consumers: %v", forwardErr)
 				}
+			} else {
+				log.Printf("No metrics found for block index %d", latestIndex)
 			}
+		} else {
+			log.Printf("No updated block indices found, cannot forward metrics")
 		}
 	}
 

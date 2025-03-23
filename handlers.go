@@ -165,29 +165,148 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, inv
 	// Extract block index - first try from arguments
 	var blockIndex uint32
 
-	if argsRaw, ok := invocation["arguments"].([]interface{}); ok && len(argsRaw) > 0 {
-		log.Printf("Found %d arguments in invocation", len(argsRaw))
+	if argsRaw, ok := invocation["arguments"].([]interface{}); ok {
+		log.Printf("Found %d arguments in invocation for %s function", len(argsRaw), functionName)
 
 		// For harvest, the block index is usually the second argument
 		if functionName == "harvest" && len(argsRaw) >= 2 {
+			log.Printf("DEBUG: Examining second argument for harvest function: %+v", argsRaw[1])
+
+			// Handle different formats for the block index
 			if indexArg, ok := argsRaw[1].(map[string]interface{}); ok {
 				// Try to extract from U32 format
 				if u32Val, ok := indexArg["U32"].(float64); ok {
 					blockIndex = uint32(u32Val)
 					log.Printf("Extracted block index %d from harvest arguments (U32 format)", blockIndex)
+				} else if u64Val, ok := indexArg["U64"].(float64); ok {
+					// Try U64 format
+					blockIndex = uint32(u64Val)
+					log.Printf("Extracted block index %d from harvest arguments (U64 format)", blockIndex)
+				} else if i128Val, ok := indexArg["I128"].(map[string]interface{}); ok {
+					// Try I128 format (common in Stellar)
+					if loVal, ok := i128Val["Lo"].(float64); ok {
+						blockIndex = uint32(loVal)
+						log.Printf("Extracted block index %d from harvest arguments (I128 format)", blockIndex)
+					}
+				} else if strVal, ok := indexArg["String"].(string); ok {
+					// Try String format
+					if idx, err := strconv.ParseUint(strVal, 10, 32); err == nil {
+						blockIndex = uint32(idx)
+						log.Printf("Extracted block index %d from harvest arguments (String format)", blockIndex)
+					}
+				} else {
+					// Log the whole argument structure for debugging
+					indexBytes, _ := json.Marshal(indexArg)
+					log.Printf("DEBUG: Could not extract block index from harvest argument structure: %s", string(indexBytes))
+				}
+			} else if floatVal, ok := argsRaw[1].(float64); ok {
+				// Direct numeric value
+				blockIndex = uint32(floatVal)
+				log.Printf("Extracted block index %d from harvest arguments (direct numeric)", blockIndex)
+			} else if strVal, ok := argsRaw[1].(string); ok {
+				// Direct string value, try to parse
+				if idx, err := strconv.ParseUint(strVal, 10, 32); err == nil {
+					blockIndex = uint32(idx)
+					log.Printf("Extracted block index %d from harvest arguments (direct string)", blockIndex)
+				}
+			} else {
+				// Log the argument type for debugging
+				log.Printf("DEBUG: Second harvest argument has unsupported type: %T", argsRaw[1])
+			}
+		}
+
+		// If we still don't have the block index, check all arguments
+		if blockIndex == 0 && functionName == "harvest" {
+			log.Printf("DEBUG: Block index not found in second argument, checking all arguments")
+			for i, arg := range argsRaw {
+				log.Printf("DEBUG: Examining argument %d: %+v", i, arg)
+
+				if indexArg, ok := arg.(map[string]interface{}); ok {
+					// Try common fields that might contain block index
+					for fieldName, fieldValue := range indexArg {
+						if strings.Contains(strings.ToLower(fieldName), "block") ||
+							strings.Contains(strings.ToLower(fieldName), "index") ||
+							fieldName == "farm_index" {
+							log.Printf("DEBUG: Found potential block index field '%s' in argument %d with value %v", fieldName, i, fieldValue)
+							if numVal, ok := fieldValue.(float64); ok {
+								blockIndex = uint32(numVal)
+								log.Printf("Extracted block index %d from argument %d field '%s'", blockIndex, i, fieldName)
+								break
+							} else if strVal, ok := fieldValue.(string); ok {
+								if idx, err := strconv.ParseUint(strVal, 10, 32); err == nil {
+									blockIndex = uint32(idx)
+									log.Printf("Extracted block index %d from argument %d field '%s'", blockIndex, i, fieldName)
+									break
+								}
+							} else if valueMap, ok := fieldValue.(map[string]interface{}); ok {
+								// Handle nested values
+								log.Printf("DEBUG: Field '%s' contains nested structure: %+v", fieldName, valueMap)
+								for subKey, subVal := range valueMap {
+									if subKey == "U32" || subKey == "U64" {
+										if numVal, ok := subVal.(float64); ok {
+											blockIndex = uint32(numVal)
+											log.Printf("Extracted block index %d from argument %d field '%s.%s'", blockIndex, i, fieldName, subKey)
+											break
+										}
+									} else if subKey == "I128" {
+										if i128Map, ok := subVal.(map[string]interface{}); ok {
+											if loVal, ok := i128Map["Lo"].(float64); ok {
+												blockIndex = uint32(loVal)
+												log.Printf("Extracted block index %d from argument %d field '%s.%s.Lo'", blockIndex, i, fieldName, subKey)
+												break
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					if blockIndex > 0 {
+						break
+					}
+				} else if numVal, ok := arg.(float64); ok {
+					// Direct numeric value
+					if i == 1 && functionName == "harvest" {
+						// Second argument in harvest is typically the index
+						blockIndex = uint32(numVal)
+						log.Printf("Extracted block index %d from direct numeric value in argument %d", blockIndex, i)
+						break
+					}
 				}
 			}
 		}
 	}
 
-	// If we couldn't extract from arguments, use ledger sequence as fallback
+	// If we couldn't extract from arguments, try finding it in the invocation data
+	if blockIndex == 0 {
+		for key, val := range invocation {
+			if (strings.Contains(strings.ToLower(key), "block") && strings.Contains(strings.ToLower(key), "index")) ||
+				key == "block_index" || key == "farm_index" {
+				if numVal, ok := val.(float64); ok {
+					blockIndex = uint32(numVal)
+					log.Printf("Extracted block index %d from invocation field '%s'", blockIndex, key)
+					break
+				} else if strVal, ok := val.(string); ok {
+					if idx, err := strconv.ParseUint(strVal, 10, 32); err == nil {
+						blockIndex = uint32(idx)
+						log.Printf("Extracted block index %d from invocation field '%s'", blockIndex, key)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// If we still couldn't find the block index, use ledger sequence as fallback
 	if blockIndex == 0 {
 		if ledgerSeq, ok := invocation["ledger_sequence"].(float64); ok {
 			blockIndex = uint32(ledgerSeq)
 			log.Printf("Using ledger sequence %d as fallback for block index", blockIndex)
 		} else {
-			log.Printf("ERROR: Could not determine block index, skipping invocation")
-			return nil
+			// As a last resort, dump the full invocation for debugging
+			invocationBytes, _ := json.Marshal(invocation)
+			log.Printf("DEBUG: Could not determine block index, full invocation data: %s", string(invocationBytes))
+			return fmt.Errorf("could not determine block index from invocation data")
 		}
 	}
 
@@ -364,28 +483,41 @@ func (p *KaleMetricsProcessor) processInvocationMessage(ctx context.Context, inv
 
 // extractBlockIndex extracts the block index from event data
 func (p *KaleMetricsProcessor) extractBlockIndex(data map[string]interface{}, eventType string) (uint32, error) {
-	log.Printf("Extracting block index from data: %+v", data)
+	log.Printf("Extracting block index from %s event type with data", eventType)
 
-	// Try common field names for block index
-	for _, key := range []string{"index", "block_index", "blockIndex", "block"} {
-		if val, ok := data[key]; ok {
-			log.Printf("Found potential block index in field %s: %v", key, val)
-
-			switch v := val.(type) {
-			case float64:
-				return uint32(v), nil
-			case int:
-				return uint32(v), nil
-			case string:
-				if index, err := strconv.ParseUint(v, 10, 32); err == nil {
-					return uint32(index), nil
-				}
-			case map[string]interface{}:
-				// Try to extract from nested map (common in Stellar contract data)
-				for subKey, subVal := range v {
-					if subKey == "U32" || subKey == "U64" {
-						if floatVal, ok := subVal.(float64); ok {
-							return uint32(floatVal), nil
+	// First check if block_index exists in the top-level data
+	if blockIdx, ok := data["block_index"]; ok {
+		log.Printf("Found block_index field directly in event data: %v (type: %T)", blockIdx, blockIdx)
+		switch v := blockIdx.(type) {
+		case float64:
+			return uint32(v), nil
+		case int:
+			return uint32(v), nil
+		case string:
+			if index, err := strconv.ParseUint(v, 10, 32); err == nil {
+				return uint32(index), nil
+			}
+		case map[string]interface{}:
+			// Try to extract from nested map (common in Stellar contract data)
+			log.Printf("Found nested block_index structure: %+v", v)
+			for subKey, subVal := range v {
+				if subKey == "U32" || subKey == "U64" {
+					if floatVal, ok := subVal.(float64); ok {
+						log.Printf("Extracted block index %d from block_index.%s", uint32(floatVal), subKey)
+						return uint32(floatVal), nil
+					}
+				} else if subKey == "I128" && subVal != nil {
+					if i128Map, ok := subVal.(map[string]interface{}); ok {
+						if loVal, ok := i128Map["Lo"].(float64); ok {
+							log.Printf("Extracted block index %d from block_index.I128.Lo", uint32(loVal))
+							return uint32(loVal), nil
+						}
+					}
+				} else if subKey == "String" {
+					if strVal, ok := subVal.(string); ok {
+						if index, err := strconv.ParseUint(strVal, 10, 32); err == nil {
+							log.Printf("Extracted block index %d from block_index.String", uint32(index))
+							return uint32(index), nil
 						}
 					}
 				}
@@ -393,11 +525,88 @@ func (p *KaleMetricsProcessor) extractBlockIndex(data map[string]interface{}, ev
 		}
 	}
 
-	// If we couldn't find the index, log the data for debugging
-	dataBytes, _ := json.Marshal(data)
-	log.Printf("Could not find block index in data: %s", string(dataBytes))
+	// Try other common field names for block index
+	for _, key := range []string{"index", "blockIndex", "block", "idx", "block_number", "farm_index"} {
+		if val, ok := data[key]; ok {
+			log.Printf("Found potential block index in field %s: %v (type: %T)", key, val, val)
 
-	return 0, fmt.Errorf("block index not found")
+			switch v := val.(type) {
+			case float64:
+				log.Printf("Extracted block index %d from %s field", uint32(v), key)
+				return uint32(v), nil
+			case int:
+				log.Printf("Extracted block index %d from %s field", uint32(v), key)
+				return uint32(v), nil
+			case string:
+				if index, err := strconv.ParseUint(v, 10, 32); err == nil {
+					log.Printf("Extracted block index %d from %s field", uint32(index), key)
+					return uint32(index), nil
+				}
+			case map[string]interface{}:
+				// Try to extract from nested map
+				log.Printf("Found nested structure in %s field: %+v", key, v)
+				for subKey, subVal := range v {
+					if subKey == "U32" || subKey == "U64" {
+						if floatVal, ok := subVal.(float64); ok {
+							log.Printf("Extracted block index %d from %s.%s", uint32(floatVal), key, subKey)
+							return uint32(floatVal), nil
+						}
+					} else if subKey == "I128" && subVal != nil {
+						if i128Map, ok := subVal.(map[string]interface{}); ok {
+							if loVal, ok := i128Map["Lo"].(float64); ok {
+								log.Printf("Extracted block index %d from %s.%s.Lo", uint32(loVal), key, subKey)
+								return uint32(loVal), nil
+							}
+						}
+					} else if subKey == "String" {
+						if strVal, ok := subVal.(string); ok {
+							if index, err := strconv.ParseUint(strVal, 10, 32); err == nil {
+								log.Printf("Extracted block index %d from %s.%s", uint32(index), key, subKey)
+								return uint32(index), nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// For Kale contract events, look for nested data structures that might contain the block index
+	if eventType == "harvest" || strings.Contains(strings.ToLower(eventType), "kale") {
+		// Check for nested blocks of data
+		for key, val := range data {
+			if nestedMap, ok := val.(map[string]interface{}); ok {
+				log.Printf("Examining nested data structure in field '%s' for potential block index", key)
+
+				// First look for fields directly related to block index
+				for nestedKey, nestedVal := range nestedMap {
+					if strings.Contains(strings.ToLower(nestedKey), "block") ||
+						strings.Contains(strings.ToLower(nestedKey), "index") ||
+						nestedKey == "farm_index" {
+						switch v := nestedVal.(type) {
+						case float64:
+							log.Printf("Extracted block index %d from nested field %s.%s", uint32(v), key, nestedKey)
+							return uint32(v), nil
+						case int:
+							log.Printf("Extracted block index %d from nested field %s.%s", uint32(v), key, nestedKey)
+							return uint32(v), nil
+						case string:
+							if index, err := strconv.ParseUint(v, 10, 32); err == nil {
+								log.Printf("Extracted block index %d from nested field %s.%s", uint32(index), key, nestedKey)
+								return uint32(index), nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// If we still can't find the block index, log the entire event data for debugging
+	dataBytes, _ := json.Marshal(data)
+	log.Printf("DEBUG: Could not find block index in %s event data: %s", eventType, string(dataBytes))
+
+	return 0, fmt.Errorf("block index not found in %s event", eventType)
 }
 
 // extractFarmerAddress extracts the farmer address from event data
